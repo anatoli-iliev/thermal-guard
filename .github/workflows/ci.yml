@@ -31,13 +31,23 @@ jobs:
         run: |
           ./thermal-guard --version
           ./thermal-guard --help
-      - name: --detect must not crash without a config or a sensor
+      - name: --detect must SUCCEED without a config, a sensor or RAPL
         run: |
-          # CI runners have no coretemp/RAPL, so this exercises the
-          # "hardware absent" paths and must fail cleanly, not traceback.
-          THERMAL_GUARD_CONFIG=/nonexistent ./thermal-guard --detect || rc=$?
-          echo "exit=${rc:-0}"
-          test "${rc:-0}" -le 78
+          # CI runners have no coretemp and no RAPL, which is exactly the
+          # "hardware absent" path. --detect must still report what it found
+          # and exit 0 — telling the user why it cannot help is the whole point.
+          THERMAL_GUARD_CONFIG=/nonexistent ./thermal-guard --detect
+          THERMAL_GUARD_CONFIG=/nonexistent ./thermal-guard --detect \
+            | grep -q 'temperature source' || { echo "detect output malformed"; exit 1; }
+
+      - name: the guard loop must refuse to start with no sensor
+        run: |
+          # Opposite of the above: actually running with nothing to measure is
+          # a hard error, not a silent no-op.
+          if timeout 10 env THERMAL_GUARD_CONFIG=/nonexistent ./thermal-guard; then
+            echo "FAIL: started with no temperature sensor"; exit 1
+          fi
+          echo "correctly refused to run without a sensor"
 
       - name: Reject invalid configuration
         run: |

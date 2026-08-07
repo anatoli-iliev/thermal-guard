@@ -30,8 +30,14 @@ STOCK_FILE="$STATE_DIR/stock-power-limit-uw"
 TURBO_FILE="$STATE_DIR/stock-no-turbo"
 PERF_FILE="$STATE_DIR/stock-max-perf-pct"
 PSTATE=/sys/devices/system/cpu/intel_pstate
+# Read the trace path out of the config WITHOUT sourcing it. Sourcing would run
+# arbitrary code from a file we are about to delete, and shellcheck cannot follow
+# a non-constant source (SC1090) either. A plain extraction is safer and clearer.
 TRACE=/var/log/thermal-trace.log
-[[ -r "$CONF" ]] && TRACE=$(. "$CONF" 2>/dev/null; echo "${TRACE:-/var/log/thermal-trace.log}")
+if [[ -r "$CONF" ]]; then
+  from_conf=$(sed -n 's/^[[:space:]]*TRACE=["'\'']\{0,1\}\([^"'\''#[:space:]]*\).*/\1/p' "$CONF" | tail -1)
+  [[ -n "$from_conf" ]] && TRACE="$from_conf"
+fi
 
 find_rapl_package() {
   local d

@@ -39,6 +39,29 @@ RESTORE_ON_EXIT=yes        # put hardware back to stock when stopped cleanly
 TRACE=/var/log/thermal-trace.log
 TRACE_MAX_BYTES=$((32*1024*1024))
 
+# --version and --help must work ANYWHERE: no config, no sensors, no root, inside a
+# container. Handle them before touching the config or the hardware, or they break
+# on exactly the machines where someone is trying to find out what this thing is.
+case "${1:-}" in
+  --version)
+    printf 'thermal-guard %s\n' "$VERSION"; exit 0 ;;
+  --help|-h)
+    cat <<EOF
+thermal-guard $VERSION — CPU thermal envelope guard with crash-surviving telemetry
+
+usage: $PROGNAME [--detect | --version | --help]
+
+  (no args)   run the guard loop (normally started by systemd)
+  --detect    print detected hardware and effective configuration, then exit
+  --version   print the version
+
+config : $CONFIG  (override with \$THERMAL_GUARD_CONFIG)
+state  : $STATE_DIR
+docs   : https://github.com/anatoli-iliev/thermal-guard
+EOF
+    exit 0 ;;
+esac
+
 if [[ -e "$CONFIG" ]]; then
   if [[ -r "$CONFIG" ]]; then
     # shellcheck source=/dev/null
@@ -138,7 +161,9 @@ count_rapl_packages() {
   printf '%d\n' "$n"
 }
 
-TEMP_SRC=$(find_temp_source) || die "no usable temperature sensor found (looked for x86_pkg_temp, coretemp, acpitz)"
+# A missing sensor is fatal for the guard loop but NOT for --detect: reporting
+# "no sensor here, and that is why I cannot help" is far more useful than exiting.
+TEMP_SRC=$(find_temp_source) || TEMP_SRC=""
 TJMAX_DETECTED=yes
 TJMAX=$(find_tjmax) || { TJMAX=100; TJMAX_DETECTED=no; }
 RAPL=$(find_rapl_package) || RAPL=""
@@ -295,13 +320,13 @@ print_detect() {
 thermal-guard $VERSION — detected configuration
 
 hardware
-  temperature source : $TEMP_SRC
+  temperature source : ${TEMP_SRC:-NONE FOUND — looked for x86_pkg_temp, coretemp, acpitz}
   Tjmax              : ${TJMAX}C$( [[ "$TJMAX_DETECTED" == no ]] && printf '   (NOT DETECTED — assumed, set thresholds manually)' )
   RAPL package       : ${RAPL:-none found}$( (( RAPL_COUNT > 1 )) && printf '   (%d packages present; only package-0 is capped)' "$RAPL_COUNT" )
   current power limit: $cur_limit
   can cap power      : $( (( CAN_CAP ))     && printf yes || printf 'NO — %s' "$CAP_WHY" )
   intel_pstate       : $( (( HAVE_PSTATE )) && printf available || printf 'NO — %s' "$PSTATE_WHY" )
-  current temp       : $(( $(<"$TEMP_SRC") / 1000 ))C
+  current temp       : $( [[ -n "$TEMP_SRC" ]] && printf '%sC' "$(( $(<"$TEMP_SRC") / 1000 ))" || printf 'unavailable' )
 
 configuration ($CONFIG$( [[ -r "$CONFIG" ]] && printf ', loaded' || printf ', absent — using defaults' ))
   power budget       : ${NORMAL_WATTS:-stock (no cap)}
@@ -326,26 +351,13 @@ EOF
 }
 
 case "${1:-}" in
-  --version) printf 'thermal-guard %s\n' "$VERSION"; exit 0 ;;
   --detect|--check) print_detect; exit 0 ;;
-  --help|-h)
-    cat <<EOF
-thermal-guard $VERSION — CPU thermal envelope guard with crash-surviving telemetry
-
-usage: $PROGNAME [--detect | --version | --help]
-
-  (no args)   run the guard loop (normally started by systemd)
-  --detect    print detected hardware and effective configuration, then exit
-  --version   print the version
-
-config : $CONFIG
-trace  : $TRACE
-docs   : https://github.com/anatoli-iliev/thermal-guard
-EOF
-    exit 0 ;;
   "") : ;;
   *) printf '%s: unknown argument %q (try --help)\n' "$PROGNAME" "$1" >&2; exit 2 ;;
 esac
+
+# From here we actually run, so a sensor is mandatory.
+[[ -n "$TEMP_SRC" ]] || die "no usable temperature sensor found (looked for x86_pkg_temp, coretemp, acpitz) — nothing to guard"
 
 # =============================================================== startup ======
 (( TRACE_OK )) || log "warning: $TRACE not writable — tracing to the journal only"
