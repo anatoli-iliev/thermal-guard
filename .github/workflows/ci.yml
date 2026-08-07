@@ -71,11 +71,18 @@ jobs:
         run: |
           set -e
           for good in 'NORMAL_WATTS=10.5' 'POLL_SEC=0.5' 'CRIT_ACTION=log-only' \
-                      'TIERS="80:11 85:7"' 'TIERS="75:13 80:11 85:7"' 'TIERS="85:7"' \
-                      'NORMAL_WATTS=11
-TIERS="85:7"'; do
+                      'TIERS="80:11 85:7"' 'TIERS="75:13 80:11 85:7"' 'TIERS="85:7"'; do
             printf '%s\n' "$good" > /tmp/tg.conf
             THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect >/dev/null \
               || { echo "FAIL: rejected valid config: $good"; exit 1; }
             echo "accepted: $good"
           done
+
+      - name: Accept a baseline budget combined with a ladder
+        run: |
+          printf 'NORMAL_WATTS=11\nTIERS="85:7"\n' > /tmp/tg.conf
+          THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect \
+            | grep -q '85C->7W' || { echo "FAIL: ladder not parsed"; exit 1; }
+          THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect \
+            | grep -qE 'baseline budget *: 11' || { echo "FAIL: baseline not applied"; exit 1; }
+          echo "baseline + ladder parsed correctly"
