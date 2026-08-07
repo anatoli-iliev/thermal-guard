@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -S warning thermal-guard install.sh uninstall.sh
+
+  smoke:
+    name: smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check every shell file
+        run: |
+          for f in thermal-guard install.sh uninstall.sh \
+                   thermal-guard.conf.example examples/*.conf; do
+            bash -n "$f" && echo "ok: $f"
+          done
+      - name: --version and --help must work anywhere
+        run: |
+          ./thermal-guard --version
+          ./thermal-guard --help
+      - name: --detect must not crash without a config or a sensor
+        run: |
+          # CI runners have no coretemp/RAPL, so this exercises the
+          # "hardware absent" paths and must fail cleanly, not traceback.
+          THERMAL_GUARD_CONFIG=/nonexistent ./thermal-guard --detect || rc=$?
+          echo "exit=${rc:-0}"
+          test "${rc:-0}" -le 78
+
+      - name: Reject invalid configuration
+        run: |
+          set -e
+          for bad in "POLL_SEC=abc" "CRIT_SAMPLES=0" "CRIT_ACTION=banana" \
+                     "NORMAL_WATTS=-5" "CLAMP_PERF_PCT=101" "DISABLE_TURBO=maybe"; do
+            echo "$bad" > /tmp/tg.conf
+            if THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect >/dev/null 2>&1; then
+              echo "FAIL: accepted invalid config: $bad"; exit 1
+            fi
+            echo "correctly rejected: $bad"
+          done
+
+      - name: Accept valid configuration including decimals
+        run: |
+          set -e
+          for good in "NORMAL_WATTS=10.5" "POLL_SEC=0.5" "CRIT_ACTION=log-only"; do
+            echo "$good" > /tmp/tg.conf
+            THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect >/dev/null \
+              || { echo "FAIL: rejected valid config: $good"; exit 1; }
+            echo "accepted: $good"
+          done

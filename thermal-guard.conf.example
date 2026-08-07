@@ -1,0 +1,76 @@
+# thermal-guard configuration — copy to /etc/thermal-guard.conf and edit.
+#
+# This file is sourced as shell. Everything is commented out, which means
+# thermal-guard runs in MONITOR-ONLY mode: it records temperatures and logs, but
+# caps nothing and shuts nothing down. That is deliberate — a daemon that
+# silently halves your CPU performance on install would be a bad neighbour.
+#
+# Run `thermal-guard --detect` at any time to see what was detected and which
+# values are actually in effect.
+
+# ---------------------------------------------------------------------------
+# THE ONE SETTING THAT MATTERS
+# ---------------------------------------------------------------------------
+# Sustained CPU package power budget, in watts. Leave unset to cap nothing.
+#
+# How to choose it: run a sustained load and watch temperature and package
+# power together. Pick the highest budget that keeps the die comfortably below
+# whatever temperature your machine misbehaves at. Raise in 1 W steps, and only
+# after a step has survived a real workload.
+#
+# `thermal-guard --detect` prints your stock limit. Starting around 60% of it is
+# a reasonable first guess if you are trying to stop thermal shutdowns.
+#
+#NORMAL_WATTS=10
+
+# Emergency budget applied when the die reaches WARN_C.
+# Default: 70% of NORMAL_WATTS.
+#CLAMP_WATTS=7
+
+# intel_pstate max_perf_pct while clamped. Ignored if intel_pstate is absent.
+#CLAMP_PERF_PCT=40
+
+# Disable turbo entirely. On a chassis that cannot dissipate the CPU's rated
+# power, turbo is what drives runaway heating. Costs peak responsiveness.
+#DISABLE_TURBO=no
+
+# ---------------------------------------------------------------------------
+# THRESHOLDS — all derived from your CPU's real Tjmax if left unset
+# ---------------------------------------------------------------------------
+# Defaults: WARN_C = Tjmax-10, CRIT_C = Tjmax-5, RECOVER_C = WARN_C-7.
+# On a 100C-Tjmax CPU that is 90 / 95 / 83.
+#
+# Lower these only if your machine misbehaves BELOW Tjmax. Some laptops remove
+# power well under Tjmax (degraded cooling, an EC threshold, or VRM protection).
+# If yours does, set CRIT_C a degree or two under the temperature at which it
+# actually dies, and WARN_C several degrees below that.
+#
+#WARN_C=85
+#CRIT_C=88
+#RECOVER_C=78
+
+# Consecutive samples at/above CRIT_C before CRIT_ACTION fires.
+# 3 samples x POLL_SEC=2 means 6 seconds, so a brief spike is ignored.
+#CRIT_SAMPLES=3
+
+# log-only      — record only; never clamp, never shut down
+# throttle-only — clamp hard and hold it, never shut down   (default)
+# poweroff      — shut down cleanly at CRIT_C. Use ONLY if your machine cuts
+#                 power abruptly below Tjmax and you would rather lose the
+#                 session than the unsaved work. It WILL power off your machine.
+#CRIT_ACTION=throttle-only
+
+# ---------------------------------------------------------------------------
+# PLUMBING
+# ---------------------------------------------------------------------------
+#POLL_SEC=2
+
+# Every sample is appended and fsynced here, so an abrupt power cut still leaves
+# the temperatures from the seconds before it. Rotated at 32 MB.
+#TRACE=/var/log/thermal-trace.log
+#TRACE_MAX_BYTES=33554432
+
+# On a clean stop (SIGTERM, e.g. `systemctl stop`), put the stock power limit and
+# turbo back, so stopping the service does not leave your CPU silently capped.
+# Set to `no` only if you want the cap to persist after the guard exits.
+#RESTORE_ON_EXIT=yes

@@ -1,0 +1,31 @@
+[Unit]
+Description=thermal-guard — CPU thermal envelope guard with crash-surviving telemetry
+Documentation=https://github.com/anatoli-iliev/thermal-guard
+After=multi-user.target
+# thermald also writes intel_pstate/max_perf_pct. Two daemons on one knob is a
+# bad time. If you would rather keep thermald, delete this line and run
+# thermal-guard with CRIT_ACTION=log-only.
+Conflicts=thermald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thermal-guard
+Restart=always
+RestartSec=5
+# Slightly favoured so it keeps sampling under heavy load — that is exactly when
+# its measurements matter.
+Nice=-10
+# On SIGTERM the guard restores the stock power limit and turbo before exiting,
+# so `systemctl stop` does not leave the CPU silently capped. Give it time.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# Needs /sys/class/powercap and /sys/devices/system/cpu. Everything else is shut.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

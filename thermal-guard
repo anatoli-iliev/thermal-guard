@@ -1,0 +1,415 @@
+#!/bin/bash
+# thermal-guard — keep a CPU inside a thermal envelope it can actually sustain,
+# and leave evidence behind if the machine dies anyway.
+#
+# SPDX-License-Identifier: MIT
+# https://github.com/anatoli-iliev/thermal-guard
+#
+# See README.md for the why. In short: some machines remove power well below the
+# CPU's own thermal limit, with no panic and no log entry, because power is cut
+# below the operating system. Many of those boards also set their ACPI thermal
+# trip points ABOVE Tjmax, which makes the kernel's graceful thermal shutdown
+# unreachable. thermal-guard caps sustained package power so the die never gets
+# there, clamps if it does, and keeps an fsynced trace so a power cut still
+# leaves you the data.
+#
+# Safe by default: with no configuration it caps nothing and shuts nothing down.
+
+set -uo pipefail
+
+VERSION=1.0.0
+PROGNAME=${0##*/}
+CONFIG=${THERMAL_GUARD_CONFIG:-/etc/thermal-guard.conf}
+STATE_DIR=${THERMAL_GUARD_STATE:-/var/lib/thermal-guard}
+
+# ============================================================== defaults ======
+# Any of these may be set in $CONFIG. Values left empty are derived from the
+# hardware at startup — see the detection section.
+POLL_SEC=2
+NORMAL_WATTS=""            # empty = do not cap. Set a number to opt in.
+CLAMP_WATTS=""             # empty = 70% of NORMAL_WATTS
+CLAMP_PERF_PCT=40
+WARN_C=""                  # empty = Tjmax - 10
+CRIT_C=""                  # empty = Tjmax - 5
+RECOVER_C=""               # empty = WARN_C - 7
+CRIT_SAMPLES=3
+CRIT_ACTION=throttle-only  # log-only | throttle-only | poweroff
+DISABLE_TURBO=no
+RESTORE_ON_EXIT=yes        # put hardware back to stock when stopped cleanly
+TRACE=/var/log/thermal-trace.log
+TRACE_MAX_BYTES=$((32*1024*1024))
+
+if [[ -e "$CONFIG" ]]; then
+  if [[ -r "$CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    . "$CONFIG" || { echo "$PROGNAME: $CONFIG has a syntax error" >&2; exit 78; }
+  else
+    echo "$PROGNAME: $CONFIG exists but is not readable" >&2; exit 77
+  fi
+fi
+
+PSTATE=/sys/devices/system/cpu/intel_pstate
+
+# ============================================================ validation ======
+# A daemon that spins at 100% CPU because sleep got a bad argument, or that fires
+# its shutdown action immediately because CRIT_SAMPLES=0, is worse than no daemon.
+# Refuse to start on nonsense rather than misbehave quietly.
+die() { echo "$PROGNAME: $*" >&2; exit 78; }
+is_num()  { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+is_int()  { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_temp() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
+
+is_num "$POLL_SEC" && awk -v v="$POLL_SEC" 'BEGIN{exit !(v>0)}' \
+  || die "POLL_SEC must be a positive number (got '$POLL_SEC')"
+is_int "$CRIT_SAMPLES" && (( CRIT_SAMPLES >= 1 )) \
+  || die "CRIT_SAMPLES must be an integer >= 1 (got '$CRIT_SAMPLES')"
+is_int "$CLAMP_PERF_PCT" && (( CLAMP_PERF_PCT >= 1 && CLAMP_PERF_PCT <= 100 )) \
+  || die "CLAMP_PERF_PCT must be 1-100 (got '$CLAMP_PERF_PCT')"
+for v in NORMAL_WATTS CLAMP_WATTS; do
+  [[ -z "${!v}" ]] && continue
+  is_num "${!v}" || die "$v must be a number in watts, decimals allowed (got '${!v}')"
+  awk -v x="${!v}" 'BEGIN{exit !(x>0)}' || die "$v must be greater than zero (got '${!v}')"
+done
+for v in WARN_C CRIT_C RECOVER_C; do
+  [[ -z "${!v}" ]] && continue
+  is_temp "${!v}" || die "$v must be a whole number of degrees C (got '${!v}')"
+done
+case "$CRIT_ACTION" in log-only|throttle-only|poweroff) ;; *)
+  die "CRIT_ACTION must be log-only, throttle-only or poweroff (got '$CRIT_ACTION')" ;;
+esac
+case "$DISABLE_TURBO" in yes|no) ;; *) die "DISABLE_TURBO must be yes or no (got '$DISABLE_TURBO')" ;; esac
+case "$RESTORE_ON_EXIT" in yes|no) ;; *) die "RESTORE_ON_EXIT must be yes or no (got '$RESTORE_ON_EXIT')" ;; esac
+is_int "$TRACE_MAX_BYTES" || die "TRACE_MAX_BYTES must be an integer"
+
+# ============================================================= detection ======
+# Resolve everything by NAME, never by index. hwmon* and thermal_zone* numbering
+# is not stable across reboots, and intel-rapl:0 is not always the package domain.
+
+find_temp_source() {
+  local z h
+  for z in /sys/class/thermal/thermal_zone*; do
+    [[ -r "$z/type" && -r "$z/temp" ]] || continue
+    [[ "$(<"$z/type")" == "x86_pkg_temp" ]] && { printf '%s\n' "$z/temp"; return 0; }
+  done
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ -r "$h/name" ]] || continue
+    if [[ "$(<"$h/name")" == "coretemp" && -r "$h/temp1_input" ]]; then
+      printf '%s\n' "$h/temp1_input"; return 0
+    fi
+  done
+  for z in /sys/class/thermal/thermal_zone*; do
+    [[ -r "$z/type" && -r "$z/temp" ]] || continue
+    [[ "$(<"$z/type")" == "acpitz" ]] && { printf '%s\n' "$z/temp"; return 0; }
+  done
+  return 1
+}
+
+# Tjmax from the hardware, not assumed. 100C and 105C are both common and
+# guessing wrong makes every derived threshold wrong.
+find_tjmax() {
+  local h
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ -r "$h/name" ]] || continue
+    if [[ "$(<"$h/name")" == "coretemp" && -r "$h/temp1_crit" ]]; then
+      printf '%s\n' "$(( $(<"$h/temp1_crit") / 1000 ))"; return 0
+    fi
+  done
+  return 1
+}
+
+find_rapl_package() {
+  local d
+  for d in /sys/class/powercap/intel-rapl:*; do
+    [[ -r "$d/name" ]] || continue
+    [[ "$(<"$d/name")" == "package-0" ]] && { printf '%s\n' "$d"; return 0; }
+  done
+  for d in /sys/class/powercap/intel-rapl:*; do
+    [[ -d "$d" && -e "$d/constraint_0_power_limit_uw" ]] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+count_rapl_packages() {
+  local d n=0
+  for d in /sys/class/powercap/intel-rapl:*; do
+    [[ -r "$d/name" ]] || continue
+    [[ "$(<"$d/name")" == package-* ]] && (( n++ ))
+  done
+  printf '%d\n' "$n"
+}
+
+TEMP_SRC=$(find_temp_source) || die "no usable temperature sensor found (looked for x86_pkg_temp, coretemp, acpitz)"
+TJMAX_DETECTED=yes
+TJMAX=$(find_tjmax) || { TJMAX=100; TJMAX_DETECTED=no; }
+RAPL=$(find_rapl_package) || RAPL=""
+RAPL_COUNT=$(count_rapl_packages)
+
+[[ -z "$WARN_C"    ]] && WARN_C=$((  TJMAX - 10 ))
+[[ -z "$CRIT_C"    ]] && CRIT_C=$((  TJMAX - 5  ))
+[[ -z "$RECOVER_C" ]] && RECOVER_C=$(( WARN_C - 7 ))
+if [[ -n "$NORMAL_WATTS" && -z "$CLAMP_WATTS" ]]; then
+  CLAMP_WATTS=$(awk -v w="$NORMAL_WATTS" 'BEGIN{v=w*0.7; if(v<1)v=1; printf "%.2f", v}')
+fi
+
+# Distinguish "the hardware cannot do this" from "we lack permission". They need
+# completely different fixes, and conflating them sends people hunting for a
+# missing driver when they simply forgot sudo.
+CAN_CAP=0; CAP_WHY=ok
+if   [[ -z "$RAPL" ]];                                  then CAP_WHY="no Intel RAPL package domain (AMD, or kernel without intel_rapl)"
+elif [[ ! -e "$RAPL/constraint_0_power_limit_uw" ]];    then CAP_WHY="RAPL present but exposes no power limit"
+elif [[ ! -w "$RAPL/constraint_0_power_limit_uw" ]];    then CAP_WHY="not writable — needs root"
+else CAN_CAP=1; fi
+
+HAVE_PSTATE=0; PSTATE_WHY=ok
+if   [[ ! -d "$PSTATE" ]];                  then PSTATE_WHY="intel_pstate driver not loaded"
+elif [[ ! -e "$PSTATE/max_perf_pct" ]];     then PSTATE_WHY="intel_pstate present but max_perf_pct missing"
+elif [[ ! -w "$PSTATE/max_perf_pct" ]];     then PSTATE_WHY="not writable — needs root"
+else HAVE_PSTATE=1; fi
+
+HAVE_LOGGER=0; command -v logger >/dev/null 2>&1 && HAVE_LOGGER=1
+
+# ============================================================== plumbing ======
+TRACE_OK=1
+if ! { : >> "$TRACE"; } 2>/dev/null; then TRACE_OK=0; fi
+
+# Event lines are prefixed '#' so the trace stays trivially parseable: strip
+# comments and every remaining line is "timestamp,temp_c,clamped".
+log() {
+  (( HAVE_LOGGER )) && logger -t thermal-guard -- "$*"
+  (( TRACE_OK ))    && printf '# %s %s\n' "$(date -Is)" "$*" >> "$TRACE"
+  (( HAVE_LOGGER || TRACE_OK )) || printf '%s: %s\n' "$PROGNAME" "$*" >&2
+  return 0
+}
+
+w_to_uw() { awk -v w="$1" 'BEGIN{printf "%d", w*1000000}'; }
+uw_to_w() { awk -v u="$1" 'BEGIN{printf "%.1f", u/1000000}'; }
+
+# --- saved hardware state, so uninstall/exit can restore the real values ------
+stock_power_file="$STATE_DIR/stock-power-limit-uw"
+stock_turbo_file="$STATE_DIR/stock-no-turbo"
+stock_perf_file="$STATE_DIR/stock-max-perf-pct"
+
+save_stock_state() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  if (( CAN_CAP )) && [[ ! -e "$stock_power_file" ]]; then
+    cp "$RAPL/constraint_0_power_limit_uw" "$stock_power_file" 2>/dev/null \
+      && log "saved stock power limit $(uw_to_w "$(<"$stock_power_file")")W"
+  fi
+  if [[ -r "$PSTATE/no_turbo" && ! -e "$stock_turbo_file" ]]; then
+    cp "$PSTATE/no_turbo" "$stock_turbo_file" 2>/dev/null
+  fi
+  if [[ -r "$PSTATE/max_perf_pct" && ! -e "$stock_perf_file" ]]; then
+    cp "$PSTATE/max_perf_pct" "$stock_perf_file" 2>/dev/null
+  fi
+}
+
+# 0 = applied, 1 = no permission, 2 = written but rejected (BIOS-locked)
+set_uw() {
+  local uw=$1 f="$RAPL/constraint_0_power_limit_uw"
+  [[ -w "$f" ]] || return 1
+  printf '%s\n' "$uw" > "$f" 2>/dev/null || return 1
+  [[ "$(<"$f")" == "$uw" ]] || return 2
+  return 0
+}
+
+last_watt_err=""
+apply_watts() {   # $1 = watts (decimals ok)
+  (( CAN_CAP )) || return 1
+  local rc msg
+  set_uw "$(w_to_uw "$1")"; rc=$?
+  case $rc in
+    0) last_watt_err=""; return 0 ;;
+    1) msg="cannot set power limit: $RAPL not writable (running as root?)" ;;
+    2) msg="cannot set power limit: BIOS rejected the write (registers locked) — P-state limiting only" ;;
+  esac
+  [[ "$msg" != "$last_watt_err" ]] && { last_watt_err="$msg"; log "warning: $msg"; }
+  return $rc
+}
+
+# Restore stock power, or fall back to NORMAL_WATTS if we never saved stock.
+restore_stock_power() {
+  (( CAN_CAP )) || return 1
+  if [[ -r "$stock_power_file" ]]; then
+    set_uw "$(<"$stock_power_file")" && return 0
+  fi
+  [[ -n "$NORMAL_WATTS" ]] && apply_watts "$NORMAL_WATTS"
+}
+
+set_perf_pct() { (( HAVE_PSTATE )) || return 1; printf '%s\n' "$1" > "$PSTATE/max_perf_pct" 2>/dev/null; }
+set_turbo()    { [[ -w "$PSTATE/no_turbo" ]] || return 1; printf '%s\n' "$1" > "$PSTATE/no_turbo" 2>/dev/null; }
+
+clamped=0
+apply_clamp() {
+  (( clamped )) && return 0
+  clamped=1
+  [[ -n "$CLAMP_WATTS" ]] && apply_watts "$CLAMP_WATTS"
+  set_perf_pct "$CLAMP_PERF_PCT"
+  log "CLAMP ON  temp=${1}C -> ${CLAMP_WATTS:-uncapped}W / max_perf_pct=${CLAMP_PERF_PCT}"
+}
+
+release_clamp() {
+  (( clamped )) || return 0
+  clamped=0
+  # If a budget is configured go back to it; otherwise go back to stock. Without
+  # this second branch a clamp with no NORMAL_WATTS set would be permanent.
+  local back
+  if [[ -n "$NORMAL_WATTS" ]]; then apply_watts "$NORMAL_WATTS"; back="${NORMAL_WATTS}W"
+  else restore_stock_power; back="stock"; fi
+  set_perf_pct 100
+  log "CLAMP OFF temp=${1}C -> $back / max_perf_pct=100"
+}
+
+rotate_trace() {
+  (( TRACE_OK )) || return 0
+  local sz
+  sz=$(stat -c %s "$TRACE" 2>/dev/null || printf 0)
+  (( sz > TRACE_MAX_BYTES )) && mv -f "$TRACE" "$TRACE.1" 2>/dev/null
+  return 0
+}
+
+# Put the hardware back on a clean stop. Without this, `systemctl stop` leaves
+# the CPU capped with no running service to explain why — the values live in
+# hardware registers and survive the process.
+restore_and_exit() {
+  trap - TERM INT
+  if [[ "$RESTORE_ON_EXIT" == yes ]]; then
+    restore_stock_power
+    set_perf_pct 100
+    [[ -r "$stock_turbo_file" ]] && set_turbo "$(<"$stock_turbo_file")"
+    log "stopping — restored stock power limit and turbo"
+  else
+    log "stopping — RESTORE_ON_EXIT=no, leaving the cap in place"
+  fi
+  exit 0
+}
+
+# ================================================================= modes ======
+print_detect() {
+  # Readable form on purpose: `A || B && C` is (A||B)&&C in bash, which is easy to
+  # misread and easy to break later.
+  local cur_limit="n/a"
+  if [[ -n "$RAPL" && -r "$RAPL/constraint_0_power_limit_uw" ]]; then
+    cur_limit="$(uw_to_w "$(<"$RAPL/constraint_0_power_limit_uw")")W"
+  fi
+  cat <<EOF
+thermal-guard $VERSION — detected configuration
+
+hardware
+  temperature source : $TEMP_SRC
+  Tjmax              : ${TJMAX}C$( [[ "$TJMAX_DETECTED" == no ]] && printf '   (NOT DETECTED — assumed, set thresholds manually)' )
+  RAPL package       : ${RAPL:-none found}$( (( RAPL_COUNT > 1 )) && printf '   (%d packages present; only package-0 is capped)' "$RAPL_COUNT" )
+  current power limit: $cur_limit
+  can cap power      : $( (( CAN_CAP ))     && printf yes || printf 'NO — %s' "$CAP_WHY" )
+  intel_pstate       : $( (( HAVE_PSTATE )) && printf available || printf 'NO — %s' "$PSTATE_WHY" )
+  current temp       : $(( $(<"$TEMP_SRC") / 1000 ))C
+
+configuration ($CONFIG$( [[ -r "$CONFIG" ]] && printf ', loaded' || printf ', absent — using defaults' ))
+  power budget       : ${NORMAL_WATTS:-stock (no cap)}
+  clamp budget       : ${CLAMP_WATTS:-n/a}
+  clamp perf pct     : $CLAMP_PERF_PCT
+  disable turbo      : $DISABLE_TURBO
+  warn / crit        : ${WARN_C}C / ${CRIT_C}C
+  recover below      : ${RECOVER_C}C
+  crit action        : $CRIT_ACTION
+  crit samples       : $CRIT_SAMPLES  (= $(awk -v a="$CRIT_SAMPLES" -v b="$POLL_SEC" 'BEGIN{printf "%g", a*b}')s sustained)
+  poll interval      : ${POLL_SEC}s
+  restore on exit    : $RESTORE_ON_EXIT
+  trace              : $TRACE $( (( TRACE_OK )) && printf '(writable)' || printf '(NOT writable — journal only)' )
+  syslog             : $( (( HAVE_LOGGER )) && printf 'via logger' || printf 'logger MISSING — stderr only' )
+EOF
+  [[ -z "$NORMAL_WATTS" ]] && cat <<EOF
+
+  No power budget set, so nothing will be capped. This is the default.
+  Set NORMAL_WATTS in $CONFIG to opt in, then restart the service.
+EOF
+  return 0
+}
+
+case "${1:-}" in
+  --version) printf 'thermal-guard %s\n' "$VERSION"; exit 0 ;;
+  --detect|--check) print_detect; exit 0 ;;
+  --help|-h)
+    cat <<EOF
+thermal-guard $VERSION — CPU thermal envelope guard with crash-surviving telemetry
+
+usage: $PROGNAME [--detect | --version | --help]
+
+  (no args)   run the guard loop (normally started by systemd)
+  --detect    print detected hardware and effective configuration, then exit
+  --version   print the version
+
+config : $CONFIG
+trace  : $TRACE
+docs   : https://github.com/anatoli-iliev/thermal-guard
+EOF
+    exit 0 ;;
+  "") : ;;
+  *) printf '%s: unknown argument %q (try --help)\n' "$PROGNAME" "$1" >&2; exit 2 ;;
+esac
+
+# =============================================================== startup ======
+(( TRACE_OK )) || log "warning: $TRACE not writable — tracing to the journal only"
+
+save_stock_state
+trap restore_and_exit TERM INT
+
+if [[ "$DISABLE_TURBO" == yes ]]; then
+  set_turbo 1 && log "turbo disabled"
+fi
+if [[ -n "$NORMAL_WATTS" ]]; then
+  apply_watts "$NORMAL_WATTS"
+else
+  # No budget configured. If an earlier run left a cap in the hardware, clear it
+  # rather than inheriting a limit nobody asked for.
+  restore_stock_power
+  log "no NORMAL_WATTS set — monitoring only, not capping power"
+fi
+set_perf_pct 100
+
+log "started v$VERSION: sensor=$TEMP_SRC tjmax=${TJMAX}C warn=${WARN_C}C crit=${CRIT_C}C recover=${RECOVER_C}C action=$CRIT_ACTION budget=${NORMAL_WATTS:-stock}"
+
+# Thresholds are meant to be edited and the failure modes are quiet, so warn.
+(( RECOVER_C < WARN_C )) || log "warning: RECOVER_C ($RECOVER_C) should be below WARN_C ($WARN_C) — the clamp will flap; leave several degrees of hysteresis"
+(( CRIT_C > WARN_C ))    || log "warning: CRIT_C ($CRIT_C) should be above WARN_C ($WARN_C) — the clamp never gets a chance to help"
+(( CRIT_C < TJMAX ))     || log "warning: CRIT_C ($CRIT_C) is at or above Tjmax (${TJMAX}C) — the hardware acts first and this will never fire"
+(( CAN_CAP ))            || log "note: power capping unavailable ($CAP_WHY) — monitoring only"
+(( HAVE_PSTATE ))        || log "note: P-state clamping unavailable ($PSTATE_WHY)"
+
+# ============================================================= main loop ======
+crit_run=0
+tick=0
+while :; do
+  raw=$(<"$TEMP_SRC") || { sleep "$POLL_SEC"; continue; }
+  t=$(( raw / 1000 ))
+
+  if (( TRACE_OK )); then
+    printf '%s,%d,%d\n' "$(date -Is)" "$t" "$clamped" >> "$TRACE"
+    if (( ++tick % 5 == 0 )); then
+      sync -f "$TRACE" 2>/dev/null || sync
+      rotate_trace
+    fi
+  fi
+
+  if (( t >= CRIT_C )); then
+    (( ++crit_run ))
+    log "CRITICAL temp=${t}C (${crit_run}/${CRIT_SAMPLES})"
+    [[ "$CRIT_ACTION" != log-only ]] && apply_clamp "$t"
+    if (( crit_run >= CRIT_SAMPLES )); then
+      if [[ "$CRIT_ACTION" == poweroff ]]; then
+        log "temp ${t}C sustained >= ${CRIT_C}C — shutting down gracefully to avoid a hardware power cut"
+        sync
+        if command -v systemctl >/dev/null 2>&1; then systemctl poweroff; else poweroff; fi
+        exit 0
+      fi
+      log "temp ${t}C sustained >= ${CRIT_C}C — CRIT_ACTION=$CRIT_ACTION, staying up"
+      crit_run=0
+    fi
+  else
+    crit_run=0
+    if   (( t >= WARN_C ));    then [[ "$CRIT_ACTION" != log-only ]] && apply_clamp "$t"
+    elif (( t <  RECOVER_C )); then release_clamp "$t"
+    fi
+  fi
+
+  sleep "$POLL_SEC"
+done
