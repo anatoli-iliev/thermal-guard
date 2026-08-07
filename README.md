@@ -2,6 +2,7 @@
 
 **Your laptop shuts off under load, with nothing in the logs. This finds out why, and stops it.**
 
+[![CI](https://github.com/anatoli-iliev/thermal-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/anatoli-iliev/thermal-guard/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Shell](https://img.shields.io/badge/shell-bash-4EAA25)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
