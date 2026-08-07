@@ -1,5 +1,6 @@
 #!/bin/bash
 # thermal-guard installer.  sudo ./install.sh
+# SPDX-FileCopyrightText: 2026 Anatoli Iliev
 # SPDX-License-Identifier: MIT
 #
 # Installs in monitor-only mode: nothing is capped and nothing is shut down until

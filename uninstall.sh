@@ -1,5 +1,6 @@
 #!/bin/bash
 # thermal-guard uninstaller.  sudo ./uninstall.sh [--purge]
+# SPDX-FileCopyrightText: 2026 Anatoli Iliev
 # SPDX-License-Identifier: MIT
 #
 # READ THIS: stopping the service is NOT enough on its own.

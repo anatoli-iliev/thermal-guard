@@ -2,6 +2,7 @@
 # thermal-guard — keep a CPU inside a thermal envelope it can actually sustain,
 # and leave evidence behind if the machine dies anyway.
 #
+# SPDX-FileCopyrightText: 2026 Anatoli Iliev
 # SPDX-License-Identifier: MIT
 # https://github.com/anatoli-iliev/thermal-guard
 #
