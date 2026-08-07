@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 PROGNAME=${0##*/}
 CONFIG=${THERMAL_GUARD_CONFIG:-/etc/thermal-guard.conf}
 STATE_DIR=${THERMAL_GUARD_STATE:-/var/lib/thermal-guard}
@@ -27,8 +27,11 @@ STATE_DIR=${THERMAL_GUARD_STATE:-/var/lib/thermal-guard}
 # Any of these may be set in $CONFIG. Values left empty are derived from the
 # hardware at startup — see the detection section.
 POLL_SEC=2
-NORMAL_WATTS=""            # empty = do not cap. Set a number to opt in.
-CLAMP_WATTS=""             # empty = 70% of NORMAL_WATTS
+NORMAL_WATTS=""            # baseline budget, applied always. Empty = stock (no cap).
+TIERS=""                   # temperature ladder, e.g. "80:11 85:7" (temp:watts, ascending)
+TIER_SAMPLES=3             # consecutive samples at/above a rung before it engages
+TIER_HYSTERESIS=7          # degrees below a rung's temp before it releases
+CLAMP_WATTS=""             # legacy shorthand: one rung at WARN_C. Empty = 70% of NORMAL_WATTS
 CLAMP_PERF_PCT=40
 WARN_C=""                  # empty = Tjmax - 10
 CRIT_C=""                  # empty = Tjmax - 5
@@ -104,6 +107,10 @@ esac
 case "$DISABLE_TURBO" in yes|no) ;; *) die "DISABLE_TURBO must be yes or no (got '$DISABLE_TURBO')" ;; esac
 case "$RESTORE_ON_EXIT" in yes|no) ;; *) die "RESTORE_ON_EXIT must be yes or no (got '$RESTORE_ON_EXIT')" ;; esac
 is_int "$TRACE_MAX_BYTES" || die "TRACE_MAX_BYTES must be an integer"
+is_int "$TIER_SAMPLES" && (( TIER_SAMPLES >= 1 )) \
+  || die "TIER_SAMPLES must be an integer >= 1 (got '$TIER_SAMPLES')"
+is_int "$TIER_HYSTERESIS" && (( TIER_HYSTERESIS >= 1 )) \
+  || die "TIER_HYSTERESIS must be an integer >= 1 (got '$TIER_HYSTERESIS')"
 
 # ============================================================= detection ======
 # Resolve everything by NAME, never by index. hwmon* and thermal_zone* numbering
@@ -176,6 +183,37 @@ RAPL_COUNT=$(count_rapl_packages)
 if [[ -n "$NORMAL_WATTS" && -z "$CLAMP_WATTS" ]]; then
   CLAMP_WATTS=$(awk -v w="$NORMAL_WATTS" 'BEGIN{v=w*0.7; if(v<1)v=1; printf "%.2f", v}')
 fi
+
+# --------------------------------------------------------------- tiers ----
+# The ladder: TIER_T[i] is a temperature, TIER_W[i] the budget to apply at or
+# above it. Tier 0 is the baseline (NORMAL_WATTS, or stock if unset).
+#
+# Escalating needs TIER_SAMPLES consecutive samples so a one-sample spike does
+# not step down performance. De-escalating needs the temperature to fall
+# TIER_HYSTERESIS degrees below the rung, so it cannot flap on the boundary.
+declare -a TIER_T=() TIER_W=()
+
+if [[ -n "$TIERS" ]]; then
+  for pair in $TIERS; do
+    [[ "$pair" =~ ^[0-9]+:[0-9]+(\.[0-9]+)?$ ]] \
+      || die "TIERS entries must be temp:watts, e.g. \"80:11 85:7\" (got '$pair')"
+    t=${pair%%:*}; w=${pair#*:}
+    (( t < TJMAX )) || die "TIERS rung ${t}C is at or above Tjmax (${TJMAX}C) — the hardware acts first"
+    if (( ${#TIER_T[@]} > 0 )) && (( t <= TIER_T[${#TIER_T[@]}-1] )); then
+      die "TIERS must be in ascending temperature order (${t}C follows ${TIER_T[${#TIER_T[@]}-1]}C)"
+    fi
+    awk -v x="$w" 'BEGIN{exit !(x>0)}' || die "TIERS watts must be greater than zero (got '$w')"
+    TIER_T+=("$t"); TIER_W+=("$w")
+  done
+elif [[ -n "$CLAMP_WATTS" ]]; then
+  # Legacy shorthand: a single rung at WARN_C, released below RECOVER_C. This
+  # reproduces pre-tier behaviour exactly for configs written before TIERS existed.
+  TIER_T+=("$WARN_C"); TIER_W+=("$CLAMP_WATTS")
+  TIER_HYSTERESIS=$(( WARN_C - RECOVER_C ))
+  (( TIER_HYSTERESIS >= 1 )) || TIER_HYSTERESIS=1
+  LEGACY_MODE=yes
+fi
+: "${LEGACY_MODE:=no}"
 
 # Distinguish "the hardware cannot do this" from "we lack permission". They need
 # completely different fixes, and conflating them sends people hunting for a
@@ -264,25 +302,28 @@ restore_stock_power() {
 set_perf_pct() { (( HAVE_PSTATE )) || return 1; printf '%s\n' "$1" > "$PSTATE/max_perf_pct" 2>/dev/null; }
 set_turbo()    { [[ -w "$PSTATE/no_turbo" ]] || return 1; printf '%s\n' "$1" > "$PSTATE/no_turbo" 2>/dev/null; }
 
-clamped=0
-apply_clamp() {
-  (( clamped )) && return 0
-  clamped=1
-  [[ -n "$CLAMP_WATTS" ]] && apply_watts "$CLAMP_WATTS"
-  set_perf_pct "$CLAMP_PERF_PCT"
-  log "CLAMP ON  temp=${1}C -> ${CLAMP_WATTS:-uncapped}W / max_perf_pct=${CLAMP_PERF_PCT}"
-}
+# --- tier engine ----------------------------------------------------------
+# cur_tier 0 = baseline (NORMAL_WATTS, or stock). Tier i>0 applies TIER_W[i-1].
+cur_tier=0
+clamped=0          # kept for the trace column: 1 whenever a tier above baseline is active
 
-release_clamp() {
-  (( clamped )) || return 0
-  clamped=0
-  # If a budget is configured go back to it; otherwise go back to stock. Without
-  # this second branch a clamp with no NORMAL_WATTS set would be permanent.
-  local back
-  if [[ -n "$NORMAL_WATTS" ]]; then apply_watts "$NORMAL_WATTS"; back="${NORMAL_WATTS}W"
-  else restore_stock_power; back="stock"; fi
-  set_perf_pct 100
-  log "CLAMP OFF temp=${1}C -> $back / max_perf_pct=100"
+apply_tier() {     # $1 = tier index, $2 = current temp
+  local i=$1 t=$2 desc perf
+  if (( i == 0 )); then
+    if [[ -n "$NORMAL_WATTS" ]]; then apply_watts "$NORMAL_WATTS"; desc="${NORMAL_WATTS}W"
+    else restore_stock_power; desc="stock"; fi
+    perf=100
+  else
+    apply_watts "${TIER_W[i-1]}"
+    desc="${TIER_W[i-1]}W"
+    # Only the top rung also pulls the P-state ceiling down: below that, capping
+    # power alone is enough and leaves the machine more responsive.
+    if (( i == ${#TIER_T[@]} )); then perf=$CLAMP_PERF_PCT; else perf=100; fi
+  fi
+  set_perf_pct "$perf"
+  cur_tier=$i
+  (( i > 0 )) && clamped=1 || clamped=0
+  log "TIER $i temp=${t}C -> $desc / max_perf_pct=$perf"
 }
 
 rotate_trace() {
@@ -330,12 +371,13 @@ hardware
   current temp       : $( [[ -n "$TEMP_SRC" ]] && printf '%sC' "$(( $(<"$TEMP_SRC") / 1000 ))" || printf 'unavailable' )
 
 configuration ($CONFIG$( [[ -r "$CONFIG" ]] && printf ', loaded' || printf ', absent — using defaults' ))
-  power budget       : ${NORMAL_WATTS:-stock (no cap)}
-  clamp budget       : ${CLAMP_WATTS:-n/a}
-  clamp perf pct     : $CLAMP_PERF_PCT
+  baseline budget    : ${NORMAL_WATTS:-stock (no cap)}
+  tier ladder        : $( if (( ${#TIER_T[@]} )); then for i in "${!TIER_T[@]}"; do printf '%sC->%sW ' "${TIER_T[i]}" "${TIER_W[i]}"; done; else printf 'none'; fi )
+  tier engage after  : $TIER_SAMPLES samples ($(awk -v a="$TIER_SAMPLES" -v b="$POLL_SEC" 'BEGIN{printf "%g", a*b}')s)
+  tier release below : rung temp minus ${TIER_HYSTERESIS}C
+  top-rung perf pct  : $CLAMP_PERF_PCT
   disable turbo      : $DISABLE_TURBO
-  warn / crit        : ${WARN_C}C / ${CRIT_C}C
-  recover below      : ${RECOVER_C}C
+  critical at        : ${CRIT_C}C$( [[ "$LEGACY_MODE" == yes ]] && printf '\n  legacy warn/recover: %sC / %sC' "$WARN_C" "$RECOVER_C" )
   crit action        : $CRIT_ACTION
   crit samples       : $CRIT_SAMPLES  (= $(awk -v a="$CRIT_SAMPLES" -v b="$POLL_SEC" 'BEGIN{printf "%g", a*b}')s sustained)
   poll interval      : ${POLL_SEC}s
@@ -343,11 +385,19 @@ configuration ($CONFIG$( [[ -r "$CONFIG" ]] && printf ', loaded' || printf ', ab
   trace              : $TRACE $( (( TRACE_OK )) && printf '(writable)' || printf '(NOT writable — journal only)' )
   syslog             : $( (( HAVE_LOGGER )) && printf 'via logger' || printf 'logger MISSING — stderr only' )
 EOF
-  [[ -z "$NORMAL_WATTS" ]] && cat <<EOF
+  if [[ -z "$NORMAL_WATTS" ]] && (( ${#TIER_T[@]} == 0 )); then
+    cat <<EOF
 
-  No power budget set, so nothing will be capped. This is the default.
-  Set NORMAL_WATTS in $CONFIG to opt in, then restart the service.
+  Nothing will be capped: no baseline budget and no tier ladder. This is the
+  default. Set NORMAL_WATTS (a constant cap) or TIERS (temperature-triggered)
+  in $CONFIG, then restart the service.
 EOF
+  elif [[ -z "$NORMAL_WATTS" ]]; then
+    cat <<EOF
+
+  Running unlimited until ${TIER_T[0]}C, then the ladder above takes over.
+EOF
+  fi
   return 0
 }
 
@@ -369,27 +419,37 @@ trap restore_and_exit TERM INT
 if [[ "$DISABLE_TURBO" == yes ]]; then
   set_turbo 1 && log "turbo disabled"
 fi
+# Establish the baseline. If an earlier run left a cap in the hardware, this
+# clears it rather than inheriting a limit nobody asked for.
 if [[ -n "$NORMAL_WATTS" ]]; then
   apply_watts "$NORMAL_WATTS"
 else
-  # No budget configured. If an earlier run left a cap in the hardware, clear it
-  # rather than inheriting a limit nobody asked for.
   restore_stock_power
-  log "no NORMAL_WATTS set — monitoring only, not capping power"
+  if (( ${#TIER_T[@]} > 0 )); then
+    log "no baseline budget — running unlimited until ${TIER_T[0]}C, then the ladder applies"
+  else
+    log "no baseline budget and no tiers — monitoring only, not capping power"
+  fi
 fi
 set_perf_pct 100
 
 log "started v$VERSION: sensor=$TEMP_SRC tjmax=${TJMAX}C warn=${WARN_C}C crit=${CRIT_C}C recover=${RECOVER_C}C action=$CRIT_ACTION budget=${NORMAL_WATTS:-stock}"
 
 # Thresholds are meant to be edited and the failure modes are quiet, so warn.
-(( RECOVER_C < WARN_C )) || log "warning: RECOVER_C ($RECOVER_C) should be below WARN_C ($WARN_C) — the clamp will flap; leave several degrees of hysteresis"
-(( CRIT_C > WARN_C ))    || log "warning: CRIT_C ($CRIT_C) should be above WARN_C ($WARN_C) — the clamp never gets a chance to help"
+if [[ "$LEGACY_MODE" == yes ]]; then
+  (( RECOVER_C < WARN_C )) || log "warning: RECOVER_C ($RECOVER_C) should be below WARN_C ($WARN_C) — the clamp will flap; leave several degrees of hysteresis"
+  (( CRIT_C > WARN_C ))    || log "warning: CRIT_C ($CRIT_C) should be above WARN_C ($WARN_C) — the clamp never gets a chance to help"
+fi
+if (( ${#TIER_T[@]} > 0 )) && (( CRIT_C <= TIER_T[${#TIER_T[@]}-1] )); then
+  log "warning: CRIT_C ($CRIT_C) is not above the top rung (${TIER_T[${#TIER_T[@]}-1]}C) — the ladder never gets a chance before the emergency fires"
+fi
 (( CRIT_C < TJMAX ))     || log "warning: CRIT_C ($CRIT_C) is at or above Tjmax (${TJMAX}C) — the hardware acts first and this will never fire"
 (( CAN_CAP ))            || log "note: power capping unavailable ($CAP_WHY) — monitoring only"
 (( HAVE_PSTATE ))        || log "note: P-state clamping unavailable ($PSTATE_WHY)"
 
 # ============================================================= main loop ======
 crit_run=0
+esc_run=0
 tick=0
 while :; do
   raw=$(<"$TEMP_SRC") || { sleep "$POLL_SEC"; continue; }
@@ -403,10 +463,34 @@ while :; do
     fi
   fi
 
+  n_tiers=${#TIER_T[@]}
+
+  # --- escalate: needs TIER_SAMPLES consecutive samples at/above the next rung
+  if (( cur_tier < n_tiers )) && (( t >= TIER_T[cur_tier] )); then
+    (( ++esc_run ))
+    if (( esc_run >= TIER_SAMPLES )); then
+      apply_tier $(( cur_tier + 1 )) "$t"
+      esc_run=0
+    fi
+  else
+    esc_run=0
+  fi
+
+  # --- de-escalate: temperature must fall TIER_HYSTERESIS below the rung that
+  #     put us here. A while-loop so a sharp drop can shed several rungs at once.
+  while (( cur_tier > 0 )) && (( t < TIER_T[cur_tier-1] - TIER_HYSTERESIS )); do
+    apply_tier $(( cur_tier - 1 )) "$t"
+  done
+
+  # --- emergency: independent of the ladder
   if (( t >= CRIT_C )); then
     (( ++crit_run ))
     log "CRITICAL temp=${t}C (${crit_run}/${CRIT_SAMPLES})"
-    [[ "$CRIT_ACTION" != log-only ]] && apply_clamp "$t"
+    # Jump straight to the top rung, bypassing the escalation debounce.
+    if (( n_tiers > 0 && cur_tier < n_tiers )) && [[ "$CRIT_ACTION" != log-only ]]; then
+      apply_tier "$n_tiers" "$t"
+      esc_run=0
+    fi
     if (( crit_run >= CRIT_SAMPLES )); then
       if [[ "$CRIT_ACTION" == poweroff ]]; then
         log "temp ${t}C sustained >= ${CRIT_C}C — shutting down gracefully to avoid a hardware power cut"
@@ -419,9 +503,6 @@ while :; do
     fi
   else
     crit_run=0
-    if   (( t >= WARN_C ));    then [[ "$CRIT_ACTION" != log-only ]] && apply_clamp "$t"
-    elif (( t <  RECOVER_C )); then release_clamp "$t"
-    fi
   fi
 
   sleep "$POLL_SEC"

@@ -191,6 +191,44 @@ range, so each watt is worth roughly the same amount of performance.
 > same problem this tool was built for. Set `CRIT_C` a degree or two below that
 > temperature and `WARN_C` several degrees lower still.
 
+### Two ways to cap
+
+**A — constant cap.** `NORMAL_WATTS=11` applies always. The die never approaches
+trouble; you never run at full speed. Safest and most predictable.
+
+**B — temperature ladder.** Run unlimited while cool, step down as it heats:
+
+```bash
+TIERS="80:11 85:7"
+#      ^      ^
+#      |      at 85°C: cap to 7W and pull max_perf_pct down
+#      at 80°C: cap to 11W
+```
+
+Rungs are `temp:watts`, ascending, all below Tjmax. A rung engages after
+`TIER_SAMPLES` consecutive samples at or above it, and releases once the
+temperature falls `TIER_HYSTERESIS` degrees below it. **Only the top rung** also
+limits `max_perf_pct` — lower rungs cap power only, which keeps the machine
+responsive. Set `NORMAL_WATTS` as well and it becomes the baseline the ladder
+returns to instead of stock.
+
+**Which should you use?** If your machine cuts power *below* Tjmax, the honest
+answer is a **constant cap with real margin**. A ladder spends that margin to buy
+performance, and reaction is not instant — polling is every `POLL_SEC` and the die
+keeps climbing for a few seconds after a cap lands. **Overshooting a rung by 2–4 °C
+is normal**, so leave room between your top rung and the temperature your machine
+actually misbehaves at.
+
+One more thing worth knowing: if a rung's budget settles *above* that rung's own
+temperature, a sustained load never falls back out of it and the ladder degenerates
+into a constant cap. Not a fault — but it means the benefit is real mainly for short,
+bursty work.
+
+Both variants for the case-study machine ship as
+[`examples/asus-s550ca.conf`](examples/asus-s550ca.conf) (constant) and
+[`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf) (ladder),
+each annotated with the measurements behind every number.
+
 ---
 
 ## Hardware support
@@ -225,7 +263,10 @@ Everything lives in `/etc/thermal-guard.conf`. Every option is documented inline
 
 | Option | Default | What it does |
 |---|---|---|
-| `NORMAL_WATTS` | *unset* | Sustained package power budget. **Unset means no cap.** Decimals allowed. |
+| `NORMAL_WATTS` | *unset* | Constant package power budget, applied always. **Unset means stock.** Decimals allowed. |
+| `TIERS` | *unset* | Temperature ladder, e.g. `"80:11 85:7"` — ascending `temp:watts` rungs |
+| `TIER_SAMPLES` | `3` | Consecutive samples at a rung before it engages |
+| `TIER_HYSTERESIS` | `7` | Degrees below a rung before it releases |
 | `CLAMP_WATTS` | 70% of `NORMAL_WATTS` | Emergency budget once `WARN_C` is reached |
 | `CLAMP_PERF_PCT` | `40` | `intel_pstate` performance ceiling while clamped |
 | `WARN_C` | `Tjmax - 10` | Clamp here |

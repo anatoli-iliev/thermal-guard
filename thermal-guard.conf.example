@@ -9,7 +9,51 @@
 # values are actually in effect.
 
 # ---------------------------------------------------------------------------
-# THE ONE SETTING THAT MATTERS
+# TWO WAYS TO CAP: pick one, or combine them
+# ---------------------------------------------------------------------------
+#
+# A) CONSTANT CAP — NORMAL_WATTS alone.
+#    The budget applies always. The die never even approaches trouble, at the
+#    cost of never running at full speed. Safest, most predictable.
+#
+# B) TEMPERATURE LADDER — TIERS.
+#    Run unlimited while cool, then step the budget down as it heats up. Better
+#    average performance, especially for bursty interactive work. The trade is
+#    that you let the die get hot first and rely on reacting in time.
+#
+#      TIERS="80:11 85:7"
+#             ^      ^
+#             |      at 85C and above, cap to 7W (and drop max_perf_pct)
+#             at 80C and above, cap to 11W
+#
+#    Rungs are "temp:watts", ascending, and every rung must be below Tjmax.
+#    A rung engages after TIER_SAMPLES consecutive samples at or above it, and
+#    releases once the temperature falls TIER_HYSTERESIS degrees below it.
+#    Only the TOP rung also pulls max_perf_pct down; lower rungs cap power only,
+#    which keeps the machine more responsive.
+#
+#    Combine them by setting both: NORMAL_WATTS is then the baseline the ladder
+#    returns to, instead of stock.
+#
+# WHICH SHOULD YOU USE?
+#    If your machine cuts power below Tjmax, the honest answer is a CONSTANT cap
+#    with enough margin. A ladder spends that margin to buy performance, and the
+#    reaction is not instant: polling is every POLL_SEC, and the die keeps
+#    climbing for a few seconds after a cap is applied. Overshooting a rung by
+#    2-4C is normal. Leave room between your top rung and the temperature your
+#    machine actually misbehaves at.
+#
+#    Also note: if a rung's budget settles ABOVE the rung's own temperature, a
+#    sustained load never falls back out of it — the ladder degenerates into a
+#    constant cap. That is not a fault, but it means the benefit is real mainly
+#    for short bursts.
+
+#TIERS="80:11 85:7"
+#TIER_SAMPLES=3
+#TIER_HYSTERESIS=7
+
+# ---------------------------------------------------------------------------
+# CONSTANT CAP
 # ---------------------------------------------------------------------------
 # Sustained CPU package power budget, in watts. Leave unset to cap nothing.
 #

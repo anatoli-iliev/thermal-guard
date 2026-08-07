@@ -52,9 +52,15 @@ jobs:
       - name: Reject invalid configuration
         run: |
           set -e
-          for bad in "POLL_SEC=abc" "CRIT_SAMPLES=0" "CRIT_ACTION=banana" \
-                     "NORMAL_WATTS=-5" "CLAMP_PERF_PCT=101" "DISABLE_TURBO=maybe"; do
-            echo "$bad" > /tmp/tg.conf
+          # NB: multi-word values need quotes inside the config file, since it is
+          # sourced as shell. TIERS='80:11 85:7' unquoted would be a syntax error,
+          # which is a different failure from the validation we are testing here.
+          for bad in 'POLL_SEC=abc' 'CRIT_SAMPLES=0' 'CRIT_ACTION=banana' \
+                     'NORMAL_WATTS=-5' 'CLAMP_PERF_PCT=101' 'DISABLE_TURBO=maybe' \
+                     'TIERS="85:7 80:11"' 'TIERS="80:abc"' 'TIERS="80:0"' \
+                     'TIERS="eighty:11"' 'TIER_SAMPLES=0' 'TIER_HYSTERESIS=0' \
+                     'TIERS="200:11"'; do
+            printf '%s\n' "$bad" > /tmp/tg.conf
             if THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect >/dev/null 2>&1; then
               echo "FAIL: accepted invalid config: $bad"; exit 1
             fi
@@ -64,8 +70,11 @@ jobs:
       - name: Accept valid configuration including decimals
         run: |
           set -e
-          for good in "NORMAL_WATTS=10.5" "POLL_SEC=0.5" "CRIT_ACTION=log-only"; do
-            echo "$good" > /tmp/tg.conf
+          for good in 'NORMAL_WATTS=10.5' 'POLL_SEC=0.5' 'CRIT_ACTION=log-only' \
+                      'TIERS="80:11 85:7"' 'TIERS="75:13 80:11 85:7"' 'TIERS="85:7"' \
+                      'NORMAL_WATTS=11
+TIERS="85:7"'; do
+            printf '%s\n' "$good" > /tmp/tg.conf
             THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect >/dev/null \
               || { echo "FAIL: rejected valid config: $good"; exit 1; }
             echo "accepted: $good"
