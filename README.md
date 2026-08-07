@@ -124,6 +124,23 @@ interactive responsiveness barely changes.
 That configuration ships as [`examples/asus-s550ca.conf`](examples/asus-s550ca.conf),
 with every number annotated. **Copy the method, not the numbers.**
 
+### The numbers were not the answer — the equation was
+
+Two more measurements turned that hand-tuned budget into something transferable.
+Thermal resistance came out at **5.24 °C/W**, and the machine was found to die at
+**89 °C**, so a safe die target is 83 °C. Those two facts alone reproduce the whole
+afternoon of trial and error:
+
+```
+indoors, 25 °C ambient:   (83 − 25) / 5.24 = 11.07 W    → the hand-tuned 11 W
+34 °C balcony:            (83 − 34) / 5.24 =  9.35 W    → the 9 W that worked there
+```
+
+The tuning was never really about 11 W. It was about `die = ambient + Rθ × watts`,
+with the ambient silently changing between the two experiments. Give the daemon the
+ambient and it does that arithmetic hourly — see
+[Adapting to the weather](#adapting-to-the-weather).
+
 ---
 
 ## Quick start
@@ -141,7 +158,7 @@ thermal-guard --detect
 ```
 
 ```
-thermal-guard 1.0.0 — detected configuration
+thermal-guard 1.2.0 — detected configuration
 
 hardware
   temperature source : /sys/class/thermal/thermal_zone7/temp
@@ -152,10 +169,15 @@ hardware
   intel_pstate       : available
   current temp       : 71C
 ...
-  No power budget set, so nothing will be capped. This is the default.
+  Nothing will be capped: no baseline budget and no tier ladder. This is the
+  default.
+
+adaptive
+  status             : off (ADAPTIVE=no) — no network, no derived values, v1.1 behaviour
 ```
 
-At this point it is only watching. Nothing about your machine has changed.
+At this point it is only watching. Nothing about your machine has changed, and
+nothing has left it.
 
 ---
 
@@ -191,7 +213,7 @@ range, so each watt is worth roughly the same amount of performance.
 > same problem this tool was built for. Set `CRIT_C` a degree or two below that
 > temperature and `WARN_C` several degrees lower still.
 
-### Two ways to cap
+### Three ways to cap
 
 **A — constant cap.** `NORMAL_WATTS=11` applies always. The die never approaches
 trouble; you never run at full speed. Safest and most predictable.
@@ -224,10 +246,324 @@ temperature, a sustained load never falls back out of it and the ladder degenera
 into a constant cap. Not a fault — but it means the benefit is real mainly for short,
 bursty work.
 
-Both variants for the case-study machine ship as
-[`examples/asus-s550ca.conf`](examples/asus-s550ca.conf) (constant) and
-[`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf) (ladder),
+**C — weather-adaptive.** `ADAPTIVE=yes`, and you set neither of the above. The
+daemon fetches the outdoor temperature for your location once an hour, estimates the
+ambient at the machine, and derives A or B from it — including the watts. Cold day,
+more watts. Heatwave, fewer watts and no ladder. See
+[Adapting to the weather](#adapting-to-the-weather) below; it is off by default and
+uses no network until you turn it on.
+
+It does not remove the judgement above, it just makes it hourly with the day's actual
+heat as an input. **If you already know your numbers, keep them** — an explicit
+`NORMAL_WATTS`, `TIERS` or `CLAMP_WATTS` pins the plan and the engine drops to
+advisory for good.
+
+All three variants for the case-study machine ship as
+[`examples/asus-s550ca.conf`](examples/asus-s550ca.conf) (constant),
+[`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf) (ladder) and
+[`examples/asus-s550ca-adaptive.conf`](examples/asus-s550ca-adaptive.conf) (weather),
 each annotated with the measurements behind every number.
+
+---
+
+## Adapting to the weather
+
+A budget tuned in February is wrong in August. This is the section about why, and
+what the daemon does about it.
+
+### The one equation
+
+A die settles where the heat it makes equals the heat the chassis can move away:
+
+```
+die temperature  =  ambient temperature  +  Rθ × package watts
+```
+
+`Rθ` (thermal resistance) is your cooling, in degrees of die rise per watt. It is a
+property of the machine — 5.24 °C/W on the case-study laptop, about 3.53 for a
+healthy design of that class. The watts are the only term this daemon controls. And
+the ambient is neither: it is just the room, and it moves 15 °C between a winter
+morning and an August afternoon.
+
+Rearranged, that is the whole feature:
+
+```
+watts  =  (die target − ambient) / Rθ
+```
+
+**This is why cold weather buys watts.** Every degree the room drops is a degree of
+die budget you did not have, and at `Rθ = 5.24` that is 0.19 W per degree. It is not
+generosity, it is the same equation read left-to-right.
+
+The die target is `CRIT_C − 5`, so the whole thing hangs off the one threshold you
+measured from your own trace. **A `CRIT_C` that is a guess produces a budget that is
+a guess** — the daemon says so at startup and in `--detect`, and that warning is the
+most important line it prints.
+
+### Quick start
+
+Four keys, in `/etc/thermal-guard.conf`:
+
+```bash
+ADAPTIVE=yes
+PLACEMENT=indoor       # or outdoor — a balcony, a van, a shed
+LOCATION=auto          # or LATITUDE=42.7 / LONGITUDE=23.3
+AMBIENT_OFFSET_C=0     # your thermometer minus what --detect says
+```
+
+Then look before you leap. Neither of these writes a hardware register or opens a
+socket:
+
+```bash
+thermal-guard --detect          # what it would do right now, and why
+thermal-guard --simulate 34     # what it would do if it were 34 °C outside
+thermal-guard --simulate unknown  # what it does when the weather is unreachable
+```
+
+### Indoors uses the weather too
+
+An indoor machine is the common case, and an outdoor-only feature would do nothing
+for it. So indoors the fetched temperature is turned into a room estimate first:
+
+```
+room = INDOOR_BASE_C + INDOOR_COUPLING × max(0, outdoor − INDOOR_BASE_C)
+```
+
+Default `22 °C` and `0.35`: a heated or cooled building sits near 22 °C, and only
+about a third of any outdoor heat *above* that gets in. **The `max(0, …)` is what
+makes winter safe** — a −10 °C reading cannot push the assumed room below the heating
+setpoint, so January does not authorise the whole stock budget. (Without that floor,
+−10 °C outdoors would ask for 17.7 W on the case-study machine.)
+
+Being straight about it: **22 and 0.35 are calibrated against one building in one
+season.** The single anchor is 32 °C outdoors measuring 25.5 °C indoors. They will be
+wrong somewhere. The escape hatches, in increasing order of bluntness, are
+`AMBIENT_OFFSET_C` (a thermometer and a subtraction), then `INDOOR_BASE_C` /
+`INDOOR_COUPLING` for a building that behaves differently in kind, then `AMBIENT_C`
+to bypass the model and the network entirely.
+
+`PLACEMENT=outdoor` skips all of that and uses the reading as-is. Getting placement
+wrong indoors is safe — you get a smaller budget than you could have had. Getting it
+wrong outdoors is not.
+
+### Why a ladder is a bad bet when it is hot
+
+A ladder's only benefit is the time spent *below* the first rung, running
+unrestricted. That time exists only while the die at light load sits well below the
+rung — and the light-load floor rises with the ambient while the rung does not. So
+the gap collapses in the heat, and what you have left is a constant cap that
+oscillates.
+
+```
+                 first rung 80 °C ────────────────────────────
+25 °C ambient:   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 14.9 °C of burst window       → ladder is worth it
+                 light-load floor 65.1 °C
+
+                 first rung 80 °C ────────────────────────────
+34 °C ambient:   ▓▓▓▓▓ 5.9 °C                                  → flat cap instead
+                 light-load floor 74.1 °C
+```
+
+The daemon measures that gap (`LADDER_MIN_WINDOW_C`, default 8 °C, with 2 °C of
+hysteresis so the mode cannot flip hourly) and picks the shape accordingly. On the
+case-study machine the crossover lands at about **32 °C ambient**.
+
+This is not theory. On a 34 °C balcony the hand-tuned `80:11 85:7` ladder clamped to
+7 W over and over, and the result was **slower than simply running a steady 9 W**.
+The engine now refuses to build that ladder.
+
+It also refuses to build a rung it could never climb back down from: if the top
+rung's own settling temperature would sit above its release point, the ladder is
+rejected and a flat cap is used. That was the other half of the balcony failure — a
+7 W clamp that stayed engaged for 11 minutes straight.
+
+### What it decides for the case-study machine
+
+`RTHETA_C_PER_W=5.24`, `CRIT_C=88` (die target 83 °C), `PLACEMENT=indoor`, stock 17 W.
+Every row below is `thermal-guard --simulate` output, not arithmetic done by hand:
+
+| Outdoor | Room estimate | Budget | Shape |
+|---|---|---|---|
+| ≤ 22 °C | 22.0 °C | **11.5 W** | ladder `80:11.5 85:7` |
+| 25 °C | 23.1 °C | 11 W | ladder `80:11 85:7` |
+| 30 °C | 24.8 °C | 11 W | ladder `80:11 85:7` |
+| 34 °C | 26.2 °C | 10.5 W | ladder `80:10.5 85:6.5` |
+| 40 °C | 28.3 °C | 10 W | ladder `80:10 85:6.5` |
+
+Two things to notice. **Winter gives 11.5 W — half a watt above the owner's
+hand-tuned 11 W**, and it is self-consistent: 11.5 W at a 22 °C room predicts 82.3 °C,
+still under the 83 °C target. And an indoor machine essentially never leaves ladder
+mode; it would need a room above 32 °C, i.e. an outdoor reading above 50 °C. That is
+correct, because the failure that motivated this feature was measured **outdoors**.
+
+Fed the two temperatures at which the shipped examples were measured, it reproduces
+them exactly:
+
+```bash
+$ thermal-guard --simulate ambient=25      # indoors, where 11 W settles at ~83 °C
+  decision                 LADDER
+  would apply              TIERS="80:11 85:7"   baseline stock, perf 40 at the top rung
+
+$ thermal-guard --simulate ambient=34      # the balcony
+  decision                 CONSTANT CAP 9W
+  would apply              NORMAL_WATTS=9   CLAMP_WATTS=6.30 at 85C   CLAMP_PERF_PCT=40
+```
+
+The first is byte-identical to
+[`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf), chosen
+automatically.
+
+### When it cannot reach the weather service
+
+**It fails safe, never optimistic.** Every one of these lands in the same place —
+`AMBIENT_FALLBACK_C` (default 35 °C, deliberately hot) and a constant cap:
+
+| What went wrong | What the daemon does |
+|---|---|
+| No network, DNS dead, HTTP error, timeout | Keeps the last reading until it ages out, then falls back |
+| Cached reading ageing towards `WEATHER_MAX_AGE_SEC` | Trusted less as it ages: at each quarter of the window the assumed ambient moves another quarter of the way to `AMBIENT_FALLBACK_C`, so the budget steps *down* while the evidence gets older |
+| Cached reading older than `WEATHER_MAX_AGE_SEC` (3 h) | Falls back completely |
+| Clock stepped backwards, so the reading has a *negative* age | Treated as stale, not fresh. Falls back |
+| Reply is not a plausible number (`999`, `NaN`, `1e9`, HTML, empty) | Rejected, previous reading kept, logged once |
+| Resumed from suspend after hours asleep | The reading is stale on the first tick back, so it drops to the fallback budget *first*, then fetches |
+| Neither `curl` nor `wget` installed | Logged once as a note at startup. The daemon starts normally on the fallback |
+
+On the case-study machine that fallback is **9 W** — the budget the measurements say
+survives the hottest condition ever tested on it. The budget only ever goes *up* on
+evidence. It never goes up on a guess, and a stale reading is a guess.
+
+The 2-second guard loop **never waits on any of this.** The fetch runs in a detached
+child with its own hard timeout; the loop only ever reads a cache file. `CRIT_C`, the
+emergency rung and the trace all run off the local sensor every 2 seconds and do not
+care whether the network exists.
+
+The systemd unit deliberately does **not** carry `After=network-online.target`, for
+the same reason. Ordering a thermal guard behind DHCP would mean a boot where the
+Wi-Fi is slow is a boot where the machine is unprotected — trading a guarantee for a
+convenience. The daemon starts capped, on the conservative budget, and relaxes when
+and if the weather arrives. The first fetch is scheduled 15–315 seconds after start,
+jittered so a crash-looping service cannot hammer a free public API.
+
+### Privacy: what leaves this machine
+
+**With `ADAPTIVE=yes` and `AMBIENT_C` empty, and only then, thermal-guard makes
+outbound network requests.** That rule is exact, it is the only rule, and `--detect`
+prints the current answer verbatim on a line that says either
+`network : YES — outbound HTTPS to api.open-meteo.com every 3600s` or
+`network : none`.
+
+| | |
+|---|---|
+| **What leaves** | A latitude and longitude, **rounded to one decimal place (~11 km)**, and a User-Agent naming the tool and version. Nothing else — no hostname, no serial, no temperatures, no configuration, no identifier of any kind |
+| **To whom** | `api.open-meteo.com` for the weather. Plus `get.geojs.io` **once**, and only if `LOCATION=auto`, to turn your IP into coordinates — retried on the next hourly attempt until it succeeds, then cached on disk and never asked again. Both free, both keyless, neither asked to remember you |
+| **How often** | One HTTPS GET per hour (`WEATHER_INTERVAL_SEC`, minimum 600). Nothing on shutdown, nothing on any other schedule |
+| **Stored where** | Coordinates in `/var/lib/thermal-guard/location`, mode 0600. Temperature in `/var/lib/thermal-guard/weather`, mode 0644 |
+
+**Turning it off**, in increasing order of bluntness:
+
+- `ADAPTIVE=no` — the default. No requests, no state files, no adaptive code runs at all.
+- `AMBIENT_C=25` **with** `ADAPTIVE=yes` — the whole engine, the physics and the
+  ladder/constant decision, with the network completely disabled. See
+  [`examples/adaptive-offline.conf`](examples/adaptive-offline.conf).
+- `LATITUDE`/`LONGITUDE` instead of `LOCATION=auto` — the weather is still fetched,
+  but your IP is never sent anywhere to be resolved. **Do this if you use a VPN**,
+  which would otherwise put your laptop in the wrong city and the wrong weather.
+
+Coordinates are rounded even when you type them at full precision, because
+Open-Meteo snaps to a ~7 km grid anyway — the extra digits would buy no accuracy and
+leak a street address. `--detect` says so, so the difference from what you typed is
+never a mystery.
+
+Removing what has been cached: `sudo rm -f /var/lib/thermal-guard/{weather,location}`.
+
+### Treating the network as hostile
+
+The daemon runs as root and now reads bytes from the internet. Those bytes are
+**never** `eval`ed, `source`d, word-split, or passed to a command. `awk` reads the
+body on stdin and prints at most one number; that number must then match a bash regex
+and fall in −90…60 °C before it can influence anything. Both cache files are read line
+by line, never sourced. Only `https://` URLs are accepted, with a character allowlist
+that excludes whitespace, quotes, backticks, pipes and angle brackets.
+
+A **fully attacker-controlled weather feed** can at worst report an implausibly cold
+ambient, and four independent layers bound what that buys:
+
+1. TLS with certificate validation and `--proto '=https'`, so a plaintext MITM cannot
+   connect at all.
+2. Indoors, the `max(0, …)` floor means no reported temperature, however cold, pushes
+   the assumed room below `INDOOR_BASE_C`.
+3. `BUDGET_MAX_W` defaults to your detected stock RAPL limit, so the worst outcome on
+   the outdoor path is the power limit the machine shipped with.
+4. `CRIT_C` and the emergency rung run every 2 seconds off the local sensor and are
+   completely independent of the network.
+
+A spoofed *hot* reading costs performance only.
+
+### The general formula, for machines that are not this laptop
+
+With `RTHETA_C_PER_W` unset the daemon assumes
+`Rθ = (Tjmax − 40) / stock_watts × 1.4` — the design point *"sustain the stock power
+limit with the die at Tjmax − 15 in a 25 °C room"*, derated by 40% because a machine
+that is dying under load does not have as-designed cooling. On the one machine where
+both are known it lands at 5.35 against a measured 5.24, and reproduces **both** field
+anchors within one 0.5 W step with no measured input at all.
+
+Substituted back, the budget at a 25 °C ambient is a fixed fraction of stock,
+**independent of TDP**:
+
+```
+budget / stock  =  (CRIT_C − 30) / (1.4 × (Tjmax − 40))
+```
+
+| Tjmax | Stock | `CRIT_C` | Rθ assumed | Budget @ 25 °C | % of stock |
+|---|---|---|---|---|---|
+| 105 °C | 17 W | 100 (default) | 5.35 | 13 W | 77% |
+| 100 °C | 15 W | 95 (default) | 5.60 | 11.5 W | 77% |
+| 100 °C | 28 W | 95 (default) | 3.00 | 21.5 W | 77% |
+| 105 °C | 125 W | 100 (default) | 0.73 | 96 W | 77% |
+| 105 °C | 17 W | **88 (measured)** | 5.35 | 10.5 W | **64%** |
+
+The percentage is the formula's answer; the budget column is that answer rounded
+down to the 0.5 W grid, which is why 13 W of 17 W reads as 76% if you divide it out.
+
+So: **77% of stock on a machine that throttles normally, and about 64% once you tell
+it the temperature your machine actually dies at.** That second number is this
+README's hand-written *"start at roughly 60% of stock"* advice, arrived at from
+physics instead of from trial and error. Set `CRIT_C`, and measure `Rθ` — the
+`--detect` output tells you how.
+
+### Known limitations, stated plainly
+
+- **`Rθ` is treated as a constant and it is not.** On the case-study machine it reads
+  8.70 at idle, 6.05 at one thread, and converges near 5.34 only once the fan
+  saturates. The design uses the loaded figure because that is the regime a sustained
+  budget is for. There is also unresolved evidence it *rises* under a long heat soak:
+  the balcony trace implies `Rθ ≥ 6.29` at one point, 20% above the design basis. If
+  that is real and sustained, 11 W indoors asymptotes to 94 °C. The mitigations are
+  `DIE_TARGET_MARGIN_C`, the top rung and `CRIT_C` — and measuring your own.
+- **An AC-versus-battery contradiction is unresolved.** The same machine measured 5.24
+  on mains and 3.80 on battery. The tool uses whatever single number you give it; give
+  it the worse (larger) one.
+- **The indoor ladder is marginal, not comfortable.** 11 W settles at ~82.6 °C against
+  an 85 °C top rung — 2.4 °C of margin, and overshoot past a rung is 2–4 °C. The 3 °C
+  between the top rung and `CRIT_C` is what absorbs it. `LADDER_TOP_MARGIN_C` widens
+  it directly — but it widens it *downwards*, towards the temperature the budget
+  settles at, so keep it below `DIE_TARGET_MARGIN_C` (default 5). Cross that line and
+  the emergency rung would sit under ordinary load; the daemon then lowers the die
+  target to one degree under the rung — and the budget with it — and says so at
+  startup and in `--detect`. Raising `DIE_TARGET_MARGIN_C` by the same amount is the
+  deliberate way to buy margin: it costs watts instead of borrowing them.
+- **`LADDER_IDLE_RISE_C` is the softest number in the design.** Left unset it is
+  derived from the *detected* stock limit, and it decides the ladder-versus-constant
+  crossover. Measure it: idle until the temperature stops falling, then
+  `idle_die_temp − ambient`.
+- **`--simulate` reports steady state only.** It does not model the 0.4–0.8 °C/s ramp
+  or the overshoot past a rung, so it cannot tell you how hot it actually gets before
+  the ladder catches it.
+- **`BUDGET_MIN_W` is a usability floor, not a safety floor.** It is the one place the
+  engine can hold a budget *above* what the physics asks for. The top rung, `WARN_C`
+  and `CRIT_C` all still act below it, and `--detect` prints `clipped-floor` when it
+  binds.
 
 ---
 
@@ -261,6 +597,8 @@ as root"*.
 Everything lives in `/etc/thermal-guard.conf`. Every option is documented inline in
 [`thermal-guard.conf.example`](thermal-guard.conf.example).
 
+### Core
+
 | Option | Default | What it does |
 |---|---|---|
 | `NORMAL_WATTS` | *unset* | Constant package power budget, applied always. **Unset means stock.** Decimals allowed. |
@@ -286,6 +624,49 @@ behaviour later.
 > work. `throttle-only` is the default because a daemon that powers off your computer
 > by surprise is a bad neighbour.
 
+### Adaptive
+
+Off by default. **With `ADAPTIVE=no` not one of these has any effect**, no adaptive
+code runs, no state file is written and no socket is opened — v1.1 behaviour byte for
+byte. The precedence rule is one sentence: *the engine only ever fills in a plan you
+left empty.* If `NORMAL_WATTS`, `TIERS` or `CLAMP_WATTS` holds a value, the engine
+computes, prints and warns, but changes nothing.
+
+**The four bold rows are the ones a normal user sets.** The rest have reasoned
+defaults; see [`thermal-guard.conf.example`](thermal-guard.conf.example) for what each
+one costs you.
+
+| Option | Default | What it does |
+|---|---|---|
+| **`ADAPTIVE`** | `no` | Master switch. `no` = nothing below runs at all |
+| **`PLACEMENT`** | `indoor` | `indoor` derives a room temperature from the outdoor reading; `outdoor` uses it as-is |
+| **`LOCATION`** | *unset* | `auto` (resolve from your IP once, then cached on disk for good) or `"lat,lon"`. **Place names are not accepted** |
+| **`AMBIENT_OFFSET_C`** | `0` | Degrees added to the derived ambient. Your thermometer minus what `--detect` says. The first knob to reach for |
+| `ADAPTIVE_MODE` | `auto` | Prefer a shape: `auto` \| `ladder` \| `constant`. Never overrides a pinned plan. `ladder` still yields to the two cases where no ladder exists: an untrusted ambient, and a budget with no room for a step below it — `--simulate` names which |
+| `LATITUDE` / `LONGITUDE` | *unset* | Explicit coordinates. Always beat `LOCATION`, and your IP is never sent anywhere. Set both or neither |
+| `AMBIENT_C` | *unset* | A fixed ambient at the machine. **Suppresses all network use** and never expires |
+| `AMBIENT_FALLBACK_C` | `35` | Ambient assumed when the real one is unknown, stale or implausible. **This is the fail-safe, so it must be hot** |
+| `RTHETA_C_PER_W` | *derived* | Degrees the die rises per watt — your cooling. **Measure it**; the whole budget scales with it |
+| `DIE_TARGET_C` | `CRIT_C − DIE_TARGET_MARGIN_C` | Steady-state die temperature the budget aims for |
+| `BUDGET_MIN_W` | `max(4, 25% of stock)` | Usability floor, **not** a safety floor — the top rung and `CRIT_C` still act below it |
+| `BUDGET_MAX_W` | detected stock limit | Ceiling. A value above the stock limit is clipped to it, with a warning |
+| `INDOOR_BASE_C` | `22` | What a heated/cooled building sits at. The indoor estimate never goes below this |
+| `INDOOR_COUPLING` | `0.35` | Fraction of the outdoor excess above `INDOOR_BASE_C` that reaches the room |
+| `DIE_TARGET_MARGIN_C` | `5` | Gap below `CRIT_C`: 1 °C package-vs-core + 2 °C die ripple + 2 °C ambient error |
+| `RTHETA_DERATE` | `1.4` | How much worse than its design point to assume cooling is, when `RTHETA_C_PER_W` is unset |
+| `BUDGET_STEP_W` | `0.5` | Quantisation, always rounded **down**. Doubles as the change deadband |
+| `LADDER_START_MARGIN_C` | `3` | First generated rung sits this far below the die target |
+| `LADDER_TOP_MARGIN_C` | `3` | Top generated rung sits this far below `CRIT_C`. This is your overshoot margin |
+| `LADDER_TOP_FACTOR` | `0.65` | Top-rung watts as a fraction of the budget, reduced further if the rung could not release |
+| `LADDER_MIN_WINDOW_C` | `8` | Minimum burst window before a ladder beats a flat cap. ±2 °C of hysteresis around it |
+| `LADDER_IDLE_RISE_C` | `0.45 × Rθ × stock` | Die rise above ambient at light load. Decides the crossover — worth measuring |
+| `WEATHER_URL` | Open-Meteo | `https://` only. Must return a `current` object with a numeric `temperature_2m` |
+| `GEOIP_URL` | GeoJS | `https://` only. Used **only** by `LOCATION=auto`, once ever — the answer is cached on disk and re-read by every later fetch, across restarts |
+| `WEATHER_INTERVAL_SEC` | `3600` | Fetch interval. Under 600 is refused |
+| `WEATHER_TIMEOUT_SEC` | `10` | Hard timeout for one attempt. The guard loop never waits on it |
+| `WEATHER_MAX_AGE_SEC` | `10800` | How long a reading is trusted **at all**; trust decays in quarters across it and the budget with it. Must be ≥ `WEATHER_INTERVAL_SEC`. Shorten it for `PLACEMENT=outdoor` |
+| `ADAPTIVE_HEARTBEAT_SEC` | `900` | How often the active plan is restated in the trace, so a post-mortem can read it. `0` disables |
+
 ---
 
 ## Reading the trace
@@ -295,7 +676,7 @@ behaviour later.
 parseable:
 
 ```
-# 2026-08-07T16:56:55+03:00 started v1.0.0: tjmax=105C warn=85C crit=88C budget=11
+# 2026-08-07T16:56:55+03:00 started v1.2.0: tjmax=105C warn=85C crit=88C budget=11
 2026-08-07T16:56:57+03:00,76,0
 2026-08-07T16:56:59+03:00,78,0
 # 2026-08-07T16:57:01+03:00 CLAMP ON  temp=85C -> 7W / max_perf_pct=40
@@ -317,6 +698,38 @@ Live decisions:
 journalctl -fu thermal-guard
 ```
 
+### What the adaptive engine writes
+
+Three more event shapes, all `#` lines, so the CSV recipe above is untouched — there
+is no fourth column and never will be.
+
+```
+# 2026-08-08T09:14:02+03:00 AMBIENT 24.6C indoor (outdoor 29.4C, age 312s, weather)
+# 2026-08-08T09:14:02+03:00 PLAN ladder TIERS="80:11.5 85:7" (was ladder TIERS="80:11 85:7") — window 18.0C vs 8.0C at 22.0C ambient (window-ok)
+# 2026-08-08T09:14:02+03:00 RESULT v=1 ambient_c=24.6 ambient_src=weather ambient_age_sec=312 rtheta=5.24 rtheta_src=config tjmax_c=105 crit_c=88 target_c=83 idle_floor_c=64.7 window_c=15.3 window_min_c=8.0 mode=ladder reason=window-ok budget_w=11 budget_src=engine tiers=80:11,85:7 clamp_w=7
+```
+
+- **`AMBIENT`** when the derived ambient moves 0.5 °C or its source changes. A
+  weather → fallback transition is always logged.
+- **`PLAN`** when the emitted plan differs from the active one, always naming the
+  previous plan. **A mode change, or anything that takes performance away, is
+  prefixed `warning:`** — those are the lines to read when the machine feels slow.
+- **`RESULT`** after every `PLAN`, and every `ADAPTIVE_HEARTBEAT_SEC` (default 15 min)
+  even when nothing changed. That heartbeat is the point: after a power cut, the last
+  `RESULT` before the gap tells you exactly which budget and mode were in force. The
+  temperature column alone cannot.
+
+```bash
+grep '^# .* RESULT '  /var/log/thermal-trace.log | tail -1   # what was active at the end
+grep '^# .* PLAN '    /var/log/thermal-trace.log             # every plan change, ever
+grep '^# .* AMBIENT ' /var/log/thermal-trace.log             # the ambient's whole history
+```
+
+`RESULT` is a stable contract: `v=1` first, fixed field order, every field always
+present, `-` for not-applicable, no spaces inside any value. Adding a field or a
+vocabulary word bumps `v`. `--detect` and `--simulate` print the same line, so you can
+diff what the daemon is doing against what it says it would do.
+
 ---
 
 ## Uninstall
@@ -324,6 +737,16 @@ journalctl -fu thermal-guard
 ```bash
 sudo ./uninstall.sh            # restores stock power limit and turbo
 sudo ./uninstall.sh --purge    # also removes config, saved state and trace
+```
+
+`--purge` removes the config, the saved hardware state, the trace, **and both
+adaptive cache files** — including `/var/lib/thermal-guard/location`, which holds
+coordinates accurate to about 11 km of where the machine lives. It then removes the
+state directory itself, and if anything unexpected is left in there it says so by
+name instead of failing silently. To remove just the location without uninstalling:
+
+```bash
+sudo rm -f /var/lib/thermal-guard/location    # forgets where it thinks it is
 ```
 
 thermal-guard saves your machine's real stock values the first time it runs
@@ -354,6 +777,13 @@ Being straight about the overlap:
 Tjmax, where you need both a hard envelope and evidence of what happened. If your
 laptop throttles normally and never cuts out, you probably want thermald.
 
+One thing none of the tools above does: **none of them knows what the weather is.**
+They all model the machine and none of them models the room the machine is in, which
+is the term that moves 15 °C between seasons and is not under anyone's control. That
+is the only capability here that is not available somewhere else — and it is optional,
+off by default, and about fifty lines of arithmetic. Most of the rest of that feature
+is making sure it can never make things worse than not having it.
+
 Note that thermald and thermal-guard both write `intel_pstate/max_perf_pct`. The
 shipped unit declares `Conflicts=thermald.service` so they cannot fight. To keep
 thermald instead, delete that line and run with `CRIT_ACTION=log-only`.
@@ -379,7 +809,51 @@ No `coretemp` sensor exposing `temp1_crit`. The derived thresholds are guesses �
 **The clamp keeps engaging**
 Your budget is too high for current conditions. Lower `NORMAL_WATTS` by 1 W. Ambient
 temperature matters a lot — the case-study machine needed about 2 W less on a 34 °C
-balcony than indoors.
+balcony than indoors. This is what `ADAPTIVE=yes` exists to do for you.
+
+**Why am I capped at 9 W?**
+Run `thermal-guard --simulate ambient=$(your room temperature)` and read the `why`
+line — it says in words which term of the equation ran out. If `--detect` shows
+`budget_src=clipped-floor`, the physics asked for even less and `BUDGET_MIN_W` is
+holding it up. If it shows `mode=constant reason=window-too-small`, see the next one.
+
+**`--detect` says `reason=ambient-unknown`**
+No trusted ambient, so the daemon is on `AMBIENT_FALLBACK_C` (35 °C) and a flat cap —
+working exactly as designed. The `last fetch` line says why: `FAILED (http-403)`,
+`FAILED (curl-6)` (DNS), `FAILED (unparseable)` (usually a captive portal),
+`never` (no fetch has completed yet — the first one is jittered 15–315 s after start).
+`AMBIENT_C=25` gives you the engine with no network at all.
+
+**Neither `curl` nor `wget` is installed**
+Not an error and never fatal. It is logged once as a `note:` at startup, and the
+daemon runs on `AMBIENT_FALLBACK_C` forever — safe, and permanently conservative.
+Install either one, or set `AMBIENT_C`.
+
+**The ladder/constant mode keeps flipping**
+It structurally cannot flip on weather noise: entry needs an 8 °C burst window, exit
+needs it under 6 °C, and the budget moves on a 0.5 W grid. If you are genuinely
+seeing it flap, your ambient estimate is swinging — check `AMBIENT_OFFSET_C` and the
+`AMBIENT` lines in the trace, and consider that `PLACEMENT=outdoor` on a machine that
+is actually indoors will track the real weather far more violently than the room does.
+
+**The budget looks wrong and `--detect` shows a stock limit you do not recognise**
+`--detect` prints it on its own line in the adaptive block, with where it came from:
+
+```
+  stock power limit  : 11W  (from saved state /var/lib/thermal-guard/stock-power-limit-uw — compare this with your CPU's rated TDP)
+```
+
+That file is a copy of your RAPL register taken the first time the guard ever ran. If
+that first run happened while an earlier experiment had already capped the package,
+the file records the **cap** as though it were stock, and it never self-corrects. Both
+the default `BUDGET_MAX_W` and the derived `LADDER_IDLE_RISE_C` come from it, and the
+idle rise is what decides ladder-versus-constant — so a stale value here can pick a
+ladder on a day that wanted a flat cap. Check it against your CPU's TDP; if it is
+wrong, stop the service, delete that file, reboot so the register returns to its real
+value, and start again. Or set `BUDGET_MAX_W` and `LADDER_IDLE_RISE_C` explicitly,
+which is what [`examples/asus-s550ca-adaptive.conf`](examples/asus-s550ca-adaptive.conf)
+does — an explicitly configured `BUDGET_MAX_W` is used as written and is never clipped
+down to a detected figure, though you do get a warning naming both numbers.
 
 ---
 
@@ -387,6 +861,10 @@ balcony than indoors.
 
 bash 4+, coreutils, `logger` (util-linux, optional — falls back to the trace file).
 systemd optional. Root to cap power; `--detect` works unprivileged.
+
+`curl` **or** `wget` — optional, and only for weather adaptation. Without either,
+thermal-guard starts normally and runs on `AMBIENT_FALLBACK_C`. There is no `jq`
+dependency and there will not be one.
 
 ## Contributing
 

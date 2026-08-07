@@ -2,14 +2,19 @@
 #
 # This file is sourced as shell. Everything is commented out, which means
 # thermal-guard runs in MONITOR-ONLY mode: it records temperatures and logs, but
-# caps nothing and shuts nothing down. That is deliberate — a daemon that
-# silently halves your CPU performance on install would be a bad neighbour.
+# caps nothing, shuts nothing down and contacts nothing over the network. That is
+# deliberate — a daemon that silently halves your CPU performance on install, or
+# that phones a stranger about where you live, would be a bad neighbour.
 #
 # Run `thermal-guard --detect` at any time to see what was detected and which
 # values are actually in effect.
+#
+# NOTE: this file is shell, so multi-word values need quotes.
+#   TIERS="80:11 85:7"   is correct
+#   TIERS=80:11 85:7     is a syntax error and the daemon will refuse to start
 
 # ---------------------------------------------------------------------------
-# TWO WAYS TO CAP: pick one, or combine them
+# THREE WAYS TO CAP: pick one, or combine them
 # ---------------------------------------------------------------------------
 #
 # A) CONSTANT CAP — NORMAL_WATTS alone.
@@ -35,6 +40,10 @@
 #    Combine them by setting both: NORMAL_WATTS is then the baseline the ladder
 #    returns to, instead of stock.
 #
+# C) WEATHER-ADAPTIVE — ADAPTIVE=yes, and you set NEITHER of the above.
+#    The daemon works out A or B for you, hourly, from the outdoor temperature
+#    where you are. See the ADAPTIVE section further down. It is off by default.
+#
 # WHICH SHOULD YOU USE?
 #    If your machine cuts power below Tjmax, the honest answer is a CONSTANT cap
 #    with enough margin. A ladder spends that margin to buy performance, and the
@@ -47,6 +56,10 @@
 #    sustained load never falls back out of it — the ladder degenerates into a
 #    constant cap. That is not a fault, but it means the benefit is real mainly
 #    for short bursts.
+#
+#    C does not remove that judgement, it just makes it every hour instead of
+#    once, with the day's actual heat as an input. If you already know your
+#    numbers, keep them: an explicit NORMAL_WATTS or TIERS always wins.
 
 #TIERS="80:11 85:7"
 #TIER_SAMPLES=3
@@ -89,6 +102,11 @@
 # If yours does, set CRIT_C a degree or two under the temperature at which it
 # actually dies, and WARN_C several degrees below that.
 #
+# CRIT_C matters twice as much once ADAPTIVE=yes: the whole adaptive budget is
+# solved backwards from it. A CRIT_C that is a guess off Tjmax produces a budget
+# that is a guess off Tjmax. Read your trace and set it before you switch the
+# adaptive engine on.
+#
 #WARN_C=85
 #CRIT_C=88
 #RECOVER_C=78
@@ -103,6 +121,358 @@
 #                 power abruptly below Tjmax and you would rather lose the
 #                 session than the unsaved work. It WILL power off your machine.
 #CRIT_ACTION=throttle-only
+
+# ===========================================================================
+# ADAPTIVE — let the weather choose the budget
+# ===========================================================================
+#
+# WHY THIS EXISTS
+#   A die settles where the heat it makes equals the heat the chassis can move:
+#
+#       die temperature  =  ambient temperature  +  Rtheta x package watts
+#
+#   Rtheta is your cooling, in degrees of die rise per watt. It is a property of
+#   the machine. The watts are what this daemon controls. The ambient is neither
+#   — it is just the room, and it moves 15C between a February morning and an
+#   August afternoon. A budget tuned in one of those is wrong in the other, and
+#   the direction it is wrong in is "too generous when it is hot", which is the
+#   direction that kills machines.
+#
+#   The measured case: on the reference laptop, 11 W settles at ~83C indoors at
+#   ~25C, and the same 11 W projects to ~92C at 34C ambient — past the 89C where
+#   that machine has actually died. It did not die, because the ladder clamped it
+#   to 7 W over and over; the result was SLOWER than simply running 9 W flat.
+#
+#   With ADAPTIVE=yes the daemon fetches the outdoor temperature once an hour,
+#   estimates the ambient at the machine, solves the equation above for the watts
+#   that land the die on a target below CRIT_C, and decides from the headroom it
+#   has whether a ladder is worth having at all today.
+#
+# WHAT IT WILL AND WILL NOT TOUCH
+#   The engine only ever fills in a plan you left empty. If NORMAL_WATTS, TIERS
+#   or CLAMP_WATTS holds a value, your numbers are used and the engine drops to
+#   advisory: it still computes and prints what it would have chosen, and warns
+#   you if your number is above what today's ambient supports, but it changes
+#   nothing. Only when all three are empty does it own the plan.
+#
+# HOW IT FAILS
+#   Safe, never optimistic. If the ambient is unknown or not a plausible number,
+#   the daemon assumes AMBIENT_FALLBACK_C (hot) and uses a constant cap. It never
+#   raises a budget on a guess and never builds a ladder it cannot justify.
+#   Age is a slope, not a cliff: a reading walks a quarter of the way towards
+#   AMBIENT_FALLBACK_C for each quarter of WEATHER_MAX_AGE_SEC it has aged, so
+#   the budget decays step by step instead of holding full value for three hours
+#   and then falling off the end. A cold morning cannot fund a hot afternoon.
+#
+# WHAT THIS COSTS YOU AT STARTUP
+#   ADAPTIVE=yes with an empty plan means the machine STARTS CAPPED, at the
+#   fallback budget, because no weather has arrived yet — typically within a few
+#   minutes. This is a deliberate departure from "no config caps nothing": you
+#   asked for the engine, and starting conservative is the safe direction.
+#
+# ---------------------------------------------------------------------------
+# PRIVACY — read this before switching it on
+# ---------------------------------------------------------------------------
+#   With ADAPTIVE=yes and AMBIENT_C empty, and only then, this daemon makes
+#   outbound network requests. Specifically:
+#
+#     WHAT LEAVES   a latitude and longitude, rounded to one decimal place
+#                   (~11 km), and a User-Agent saying "thermal-guard/<version>".
+#                   Nothing else. No hostname, no serial, no temperatures, no
+#                   configuration, no identifier of any kind, ever.
+#     TO WHOM       api.open-meteo.com (the weather). Plus get.geojs.io ONCE, and
+#                   only if LOCATION=auto, to turn your IP into coordinates —
+#                   retried on the next hourly attempt until it succeeds, then
+#                   cached on disk, re-read by every later fetch, and never asked
+#                   again even across restarts. (Delete
+#                   /var/lib/thermal-guard/location to ask it again.) Both are
+#                   free and keyless; neither is asked to remember you.
+#     HOW OFTEN     once every WEATHER_INTERVAL_SEC, default 3600s. One HTTPS
+#                   GET per hour. Nothing on shutdown, nothing on a schedule you
+#                   did not set.
+#     STORED WHERE  the coordinates land in /var/lib/thermal-guard/location,
+#                   mode 0600. The temperature lands in
+#                   /var/lib/thermal-guard/weather, mode 0644.
+#
+#   HOW TO TURN IT OFF, in increasing order of bluntness:
+#     - ADAPTIVE=no (the default) — no requests, no state files, nothing.
+#     - AMBIENT_C=25 with ADAPTIVE=yes — you get the whole engine, the physics
+#       and the ladder/constant decision, with the network completely disabled.
+#     - LATITUDE/LONGITUDE instead of LOCATION=auto — the weather is still
+#       fetched, but your IP is never sent anywhere to be resolved. Do this if
+#       you are behind a VPN, which would otherwise put you in the wrong city.
+#
+#   `thermal-guard --detect` prints the rule and the current answer verbatim, on
+#   a line that says either "network: YES — outbound HTTPS to ..." or
+#   "network: none". If you are ever unsure what this thing is doing, ask it.
+#
+#   The bytes that come back are treated as hostile: the daemon runs as root, so
+#   nothing off the wire is ever evaluated, sourced, word-split or passed to a
+#   command, and a parsed temperature must be a plain number in -90..60C before
+#   it can influence anything. Both cache files are read line by line, never
+#   sourced. A hostile weather feed can at worst make your laptop slower.
+
+# ---------------------------------------------------------------------------
+# ADAPTIVE, tier 1 — the four keys most people set
+# ---------------------------------------------------------------------------
+
+# The master switch. `no` is not a code path that does nothing: none of the
+# adaptive code is entered at all. No network, no state files, no derived
+# values, no behaviour change of any kind from version 1.1.
+#ADAPTIVE=no
+
+# Where the machine physically sits.
+#   indoor  — the fetched outdoor temperature is turned into a ROOM temperature
+#             (see INDOOR_BASE_C / INDOOR_COUPLING below), because a heated or
+#             air-conditioned building tracks outdoors damped, not one-for-one.
+#   outdoor — the fetched temperature is used as-is. A balcony, a van, a shed,
+#             a garage, a machine in an unconditioned room in a hot climate.
+# Getting this wrong indoors is SAFE (you get a lower budget than you could
+# have). Getting it wrong outdoors is not.
+#PLACEMENT=indoor
+
+# Where to fetch the weather for.
+#   auto        — resolve your coordinates once from your IP and cache them in
+#                 /var/lib/thermal-guard/location. Fine at home; wrong behind a
+#                 VPN or on CGNAT, in which case set LATITUDE/LONGITUDE instead.
+#   "lat,lon"   — decimal degrees, e.g. LOCATION="42.7,23.3"
+#   unset       — with ADAPTIVE=yes and no AMBIENT_C, the daemon refuses to
+#                 start rather than silently guess. That is on purpose.
+#
+# A PLACE NAME IS NOT ACCEPTED. LOCATION=Sofia is a startup error, not a
+# lookup — a second network endpoint and a second parser to talk to it is more
+# attack surface than a city name is worth. To find your coordinates: open
+# https://www.openstreetmap.org, right-click your street, "Show address" —
+# the two numbers in the URL are latitude and longitude. One decimal place is
+# plenty, and is all the daemon keeps: everything is rounded to ~11 km before it
+# enters a URL or a file, including coordinates you typed yourself. Open-Meteo
+# snaps to a ~7 km grid regardless, so the extra digits would buy no accuracy and
+# leak your street.
+#LOCATION=auto
+
+# Degrees added to the derived ambient, after the indoor/outdoor transform.
+# THE ONE KNOB TO REACH FOR WHEN THE MODEL DOES NOT MATCH REALITY.
+#
+# Put a thermometer next to the laptop, run `thermal-guard --detect`, compare it
+# with the "ambient in use" line, and set the difference. A hot flat, a sunny
+# desk, a laptop in a docking sleeve or on a balcony that catches the afternoon
+# sun are all a positive number here. Positive means a LOWER budget.
+#AMBIENT_OFFSET_C=0
+
+# ---------------------------------------------------------------------------
+# ADAPTIVE, tier 2 — tuning
+# ---------------------------------------------------------------------------
+
+# Force the plan shape instead of letting the burst-window test decide.
+#   auto     — decide hourly (default, recommended)
+#   ladder   — always build a ladder. Do not set this because you like ladders;
+#              on a hot day it recreates exactly the clamp-oscillation this
+#              feature exists to avoid.
+#   constant — always a flat cap. Predictable, slightly slower, hard to regret.
+# Neither value can override an explicit NORMAL_WATTS/TIERS.
+#
+# ladder is "prefer a ladder", not "a ladder whatever happens". Two things still
+# override it, and --simulate names whichever one fired:
+#   * no trusted ambient (network down, reading stale or implausible) — the
+#     fail-safe path is always a constant cap;
+#   * a ladder that cannot be built at this ambient — no step between the
+#     working budget and the top rung, or a rung that could never release.
+#ADAPTIVE_MODE=auto
+
+# Explicit coordinates. These always beat LOCATION, and using them means your IP
+# is never sent to a geolocation service. Set both or neither.
+#LATITUDE=42.7
+#LONGITUDE=23.3
+
+# A fixed ambient at the machine, in degrees C. Setting this SUPPRESSES ALL
+# NETWORK USE — no weather, no geolocation, nothing — and never expires. Use it
+# for an air-gapped machine, a server room with a known temperature, or if you
+# simply do not want this daemon talking to anyone. You keep the physics, the
+# budget solver and the ladder/constant decision; you lose only the hourly
+# update. Remember to change it when the season does.
+#AMBIENT_C=25
+
+# The ambient assumed whenever the real one is unknown, stale or implausible.
+# THIS IS THE FAIL-SAFE, SO IT MUST BE HOT. It is the ambient AT THE MACHINE and
+# bypasses the indoor/outdoor transform and AMBIENT_OFFSET_C entirely. Setting it
+# low does not make your machine faster; it makes a network outage dangerous.
+# The daemon warns at startup if you set it below 25.
+#AMBIENT_FALLBACK_C=35
+
+# Degrees the die rises per watt of package power — your cooling, measured.
+# MEASURE THIS. The entire budget scales linearly with it, and the derived
+# default is an educated guess about a machine the author has never seen.
+#
+# How: run a sustained single-workload load until the temperature stops rising
+# (10+ minutes), then read the die temperature and the package power together and
+#     RTHETA_C_PER_W = (die_temp - ambient_temp) / package_watts
+# On the reference laptop that is (83 - 25) / 11 = 5.27, and repeated properly
+# under load it came out at 5.24 against ~3.53 for a healthy design of that class.
+#
+# Left empty it is derived as (Tjmax - 40) / stock_watts x RTHETA_DERATE, which
+# is the design point "sustain the stock power limit with the die at Tjmax-15 in
+# a 25C room", derated. On the reference machine that lands at 5.35 against the
+# measured 5.24 — close, but do not rely on close.
+#
+# Two honest caveats. Rtheta is not really a constant: on the reference machine
+# it reads 8.70 at idle, 6.05 at one thread and settles near 5.34 only once the
+# fan has saturated, and there is unresolved evidence it drifts upward under a
+# long heat soak. The loaded figure is the right one to use, because that is the
+# regime a sustained budget is for. And a battery-only measurement on the same
+# machine gave 3.80; if yours differs between AC and battery, use the WORSE
+# (larger) number.
+#RTHETA_C_PER_W=5.24
+
+# The steady-state die temperature the budget aims for. Empty means
+# CRIT_C - DIE_TARGET_MARGIN_C, which is almost always what you want: it makes
+# the whole engine follow the one threshold you measured. Set this directly only
+# if you want the budget to aim somewhere unrelated to your emergency threshold.
+#DIE_TARGET_C=83
+
+# The band the computed budget is clamped into.
+#   BUDGET_MIN_W  empty = max(4, 25% of your stock limit). A USABILITY floor, not
+#                 a safety floor: it stops a heatwave from proposing 3 W and
+#                 making the machine unusable. The top rung, WARN_C/CLAMP_WATTS
+#                 and CRIT_C all still act below it, so it cannot make you
+#                 unsafe — but `--detect` says "clipped-floor" when it binds, and
+#                 that is the daemon telling you the physics wanted less.
+#   BUDGET_MAX_W  empty = your detected stock RAPL limit. A value above the stock
+#                 limit is clipped to it with a warning; the daemon cannot make
+#                 your CPU faster than it shipped.
+#BUDGET_MIN_W=4.25
+#BUDGET_MAX_W=17
+
+# THE INDOOR MODEL (ignored entirely when PLACEMENT=outdoor)
+#
+#     room = INDOOR_BASE_C + INDOOR_COUPLING x max(0, outdoor - INDOOR_BASE_C)
+#
+# In words: a heated or cooled building sits near INDOOR_BASE_C, and only a
+# fraction of any outdoor heat ABOVE that gets in. The max(0, ...) is what makes
+# winter safe — a cold outdoor reading can never push the assumed room below the
+# heating setpoint, so a January morning does not authorise the whole stock
+# budget, and neither does a spoofed -40C reading.
+#
+# BE HONEST ABOUT WHERE THIS CAME FROM: 22C and 0.35 are calibrated against ONE
+# building in ONE season (32C outdoors measured 25.5C indoors). They will be
+# wrong somewhere. If your flat runs hot, the cheap fix is AMBIENT_OFFSET_C; if
+# it behaves differently in kind — a top-floor flat with no air conditioning, an
+# office that is 21C all year — change these two instead. If you have no idea,
+# AMBIENT_C is the model-free answer.
+#INDOOR_BASE_C=22
+#INDOOR_COUPLING=0.35
+
+# ---------------------------------------------------------------------------
+# ADAPTIVE, tier 3 — advanced. The defaults are the reasoned ones.
+# ---------------------------------------------------------------------------
+
+# How far below CRIT_C the die target sits when DIE_TARGET_C is empty. It is not
+# a round number: 1C for package-vs-hottest-core, 2C of die ripple at a fixed
+# power, 2C of error in the ambient estimate. Raising it is the blunt way to buy
+# margin everywhere at once — a watt or so per degree on the reference machine.
+#DIE_TARGET_MARGIN_C=5
+
+# How much worse than its design point to assume the cooling is, when
+# RTHETA_C_PER_W is empty. 1.0 means "as designed", which for a laptop that is
+# dying under load it demonstrably is not. Irrelevant once you measure Rtheta.
+#RTHETA_DERATE=1.4
+
+# Budget quantisation, always rounded DOWN. This is also the change deadband:
+# hourly weather noise cannot move the plan without moving it a full step, which
+# on a machine at ~200 MHz per watt is about 100 MHz. Smaller means twitchier
+# logs for no real gain.
+#BUDGET_STEP_W=0.5
+
+# Where the two generated rungs go, when the engine builds a ladder:
+#   first rung = DIE_TARGET_C - LADDER_START_MARGIN_C
+#   top rung   = CRIT_C       - LADDER_TOP_MARGIN_C
+# LADDER_TOP_MARGIN_C is the gap that absorbs overshoot past the top rung. With
+# 2s polling and a 0.4-0.8 C/s ramp, 2-4C of overshoot is normal, so 3C is thin
+# on purpose — it is what makes the generated ladder match a hand-tuned one.
+#
+# Widen it if you would rather be slow than sorry, but understand the trade:
+# widening it lowers the emergency rung towards the die target, and the budget
+# settles AT that target. Keep LADDER_TOP_MARGIN_C BELOW DIE_TARGET_MARGIN_C
+# (default 5) or the emergency rung ends up under ordinary load — the permanent
+# clamp-and-release this feature exists to prevent. If you cross that line the
+# daemon lowers the die target to one degree under the rung, and therefore the
+# budget too, and says so at startup and in --detect. Raising DIE_TARGET_MARGIN_C
+# by the same amount is the deliberate way to buy the margin.
+#LADDER_START_MARGIN_C=3
+#LADDER_TOP_MARGIN_C=3
+
+# The top (emergency) rung's watts, as a fraction of the working budget. 0.65
+# because 0.65 x 11 = 7.15 -> 7 W, and 7 W is the measured budget that holds the
+# reference chassis at ~71C on a 34C balcony. It is reduced further if a rung at
+# that power could not cool back below its own release temperature — the failure
+# that made a clamp stick for 11 minutes in the field.
+#LADDER_TOP_FACTOR=0.65
+
+# The ladder-versus-constant test, in one number.
+#
+# A ladder only pays for itself while the die at LIGHT load sits well below the
+# first rung: that gap is the time you spend running unrestricted. The light-load
+# floor rises with the ambient and the rung does not, so on a hot day the gap
+# collapses and the "ladder" is really a constant cap that oscillates. This is
+# the minimum gap, in degrees, before a ladder is preferred. There is 2C of
+# hysteresis around it so the mode cannot flip back and forth hourly.
+#
+# On the reference machine that puts the crossover at ~32C ambient: below it a
+# ladder, above it a flat cap. Both measured anchors (25C indoors, 34C balcony)
+# sit cleanly on opposite sides.
+#LADDER_MIN_WINDOW_C=8
+
+# Degrees the die sits above ambient at LIGHT load — the light-load floor above
+# is ambient plus this. Empty = 0.45 x Rtheta x stock, which is not a fudge: idle
+# package power is 0.27 of stock and idle Rtheta is 1.66x the loaded figure
+# because the fan is not spinning, and 0.27 x 1.66 = 0.45. On the reference
+# machine it returns 40.1C, which is exactly the measured indoor cooldown floor
+# (65C at 25C ambient).
+#
+# This is the softest number in the whole design and it is worth measuring: let
+# the machine idle until the temperature stops falling, and set
+#     LADDER_IDLE_RISE_C = idle_die_temp - ambient
+# Too low and you get a ladder on a day that does not deserve one.
+#LADDER_IDLE_RISE_C=40.1
+
+# Where the weather comes from. https only, and the two placeholders are the only
+# substitution performed. Empty uses the built-in Open-Meteo endpoint:
+#   https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m
+# Any replacement must return the same shape — a "current" object containing a
+# numeric "temperature_2m" — because that is what the parser looks for.
+#WEATHER_URL=""
+
+# IP-to-coordinates, used ONLY by LOCATION=auto and only once per daemon
+# lifetime. Empty uses https://get.geojs.io/v1/ip/geo.json. Set LATITUDE and
+# LONGITUDE instead and this is never contacted at all.
+#GEOIP_URL=""
+
+# The fetch schedule. The 2-second guard loop NEVER waits on any of this: the
+# fetch happens in a detached child with its own hard timeout, and the loop only
+# ever reads the cache file that child left behind. Under 600s is refused —
+# hammering a free public service buys nothing, because the weather does not move
+# that fast.
+#WEATHER_INTERVAL_SEC=3600
+#WEATHER_TIMEOUT_SEC=10
+
+# How long a cached reading is trusted at all — a trust window, not just a cache
+# lifetime. Default 3 hours = three missed fetches. Must be at least
+# WEATHER_INTERVAL_SEC, or every reading is stale before its replacement could
+# possibly arrive.
+#
+# Trust decays across the window rather than ending at a cliff: at each quarter
+# of it the assumed ambient moves another quarter of the way from the reading
+# towards AMBIENT_FALLBACK_C, so the budget steps down as the evidence ages and
+# reaches the full fallback at the horizon. Shorten it if the machine lives
+# outdoors, where the reading is used undamped and a morning number says very
+# little about the afternoon; lengthen it if your network is flaky and the
+# machine is indoors, where a building damps the swing anyway.
+#WEATHER_MAX_AGE_SEC=10800
+
+# How often the active plan is restated in the trace, even when nothing changed.
+# This is what makes a post-mortem possible: after a power cut the last RESULT
+# line before the gap tells you exactly which budget and mode were in force, and
+# the temperature column alone cannot. 0 disables it.
+#ADAPTIVE_HEARTBEAT_SEC=900
 
 # ---------------------------------------------------------------------------
 # PLUMBING
