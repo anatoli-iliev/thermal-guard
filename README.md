@@ -776,11 +776,17 @@ reports each **episode** — an unbroken stretch above the baseline tier — wit
 it actually ran:
 
 ```bash
-./contrib/thermal-clamps.sh              # last hour
-./contrib/thermal-clamps.sh "" 6         # last six hours
-./contrib/thermal-clamps.sh "" 0.25      # the last 15 minutes
-./contrib/thermal-clamps.sh "" 1 85 88   # thresholds matching your own config
+./contrib/thermal-clamps.sh             # the last hour
+./contrib/thermal-clamps.sh 6           # the last six hours
+./contrib/thermal-clamps.sh 0.25        # the last fifteen minutes
+./contrib/thermal-clamps.sh 1 -w 85 -c 88          # thresholds matching your own config
+./contrib/thermal-clamps.sh 24 -f /mnt/rescued-trace.log
 ```
+
+The window is the thing you change, so it is the first argument. `-f` points at a
+different trace, `--help` lists the rest. The older `[file] [hours]` order still
+parses — a positional that looks like a number is a duration, one that does not is a
+path — so nothing written before this changed needs updating.
 
 ```
 == thermal-guard: last 3h of /var/log/thermal-trace.log ==
@@ -946,8 +952,9 @@ All of the above in one screen — [`contrib/thermal-summary.sh`](contrib/therma
 suitable for a cron job or a login shell:
 
 ```bash
-./contrib/thermal-summary.sh                              # last 24 h
-./contrib/thermal-summary.sh /var/log/thermal-trace.log 1 # last hour
+./contrib/thermal-summary.sh            # the last 24 hours
+./contrib/thermal-summary.sh 1          # the last hour
+./contrib/thermal-summary.sh 24 -f /mnt/rescued-trace.log
 ```
 
 ```
