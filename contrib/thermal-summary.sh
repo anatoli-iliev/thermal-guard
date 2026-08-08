@@ -91,15 +91,45 @@ for d in /sys/class/powercap/intel-rapl:*; do
   break
 done
 
+# How old the newest sample is. The temperature on its own is not worth much
+# without it: a trace that stopped three hours ago still has a newest sample, and
+# printing that as the current temperature is exactly how a post-mortem reading
+# gets mistaken for a live one — in the case this tool is really for, a power cut,
+# that is the default outcome. GNU date parses the offset the timestamps already
+# carry; where `date -d` is missing the absolute clock time is printed instead,
+# because a wrong interval is worse than no interval.
+AGE_S=-1; AGE_ABS=""
+last_line=$(grep -v '^#' "$T" | awk -F, 'NF==3' | tail -1)
+if [[ -n "$last_line" ]]; then
+  last_ts=${last_line%%,*}
+  AGE_ABS=${last_ts:11:8}
+  if now_s=$(date +%s 2>/dev/null) && then_s=$(date -d "$last_ts" +%s 2>/dev/null); then
+    AGE_S=$(( now_s - then_s ))
+    (( AGE_S < 0 )) && AGE_S=0        # clock skew, or a trace written in the future
+  fi
+fi
+
 grep -v '^#' "$T" | awk -F, 'NF==3' | tail -"$SAMPLES" |
-  awk -F, '
-    { n++; c += $3; t = $2 + 0; s += t
+  awk -F, -v age_s="$AGE_S" -v age_abs="$AGE_ABS" '
+    # Same shape as thermal-clamps.sh, so the two tools read alike.
+    function fmt(s,   h, m) {
+      if (s < 60)   return sprintf("%ds", s)
+      if (s < 3600) { m = int(s/60); return sprintf("%dm%02ds", m, s-m*60) }
+      h = int(s/3600); m = int((s-h*3600)/60)
+      return sprintf("%dh%02dm", h, m)
+    }
+    { n++; c += $3; t = $2 + 0; s += t; t_last = t
       if (t > max) max = t
       if (t >= 85) hot++ }
     END {
       if (!n) { print "temps  : no sample lines in this trace"; exit }
-      printf "temps  : mean %.1fC  peak %.0fC  %.1f%% clamped  (%d samples)\n",
-             s/n, max, 100*c/n, n
+      # "now" is a claim about currency, so it is only made when the sample is
+      # recent — 60s is 30 missed polls at the default 2s interval. Past that the
+      # word itself changes rather than leaving the age to be read carefully.
+      if (age_s >= 0) { lbl = (age_s <= 60 ? "now" : "last"); ago = fmt(age_s) " ago" }
+      else            { lbl = "last"; ago = "at " age_abs }
+      printf "temps  : %s %.0fC (%s)  mean %.1fC  peak %.0fC  %.1f%% clamped  (%d samples)\n",
+             lbl, t_last, ago, s/n, max, 100*c/n, n
       printf "hot    : %d samples at or above 85C%s\n",
              hot, (hot ? "  <- check what your machine actually misbehaves at" : "")
     }'

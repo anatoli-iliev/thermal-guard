@@ -50,7 +50,7 @@ switch things on after you have looked at your own data.
 | | |
 |---|---|
 | **`thermal-guard`** | the daemon: caps power, clamps if needed, records everything |
-| **[`contrib/thermal-summary.sh`](contrib/thermal-summary.sh)** | one screen: what is in force, how hot it has been, what changed |
+| **[`contrib/thermal-summary.sh`](contrib/thermal-summary.sh)** | one screen: what is in force, how hot it is now and has been, what changed |
 | **[`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh)** | the detailed view: every time it had to throttle, for how long, at what power, and how warm it was outside |
 
 ### Getting started
@@ -467,6 +467,73 @@ The first is byte-identical to
 [`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf), chosen
 automatically.
 
+### Nudging the engine without pinning it
+
+Sooner or later the engine hands you a number you would like to be a little larger.
+The obvious move — writing `TIERS` or `CLAMP_WATTS` into the config — is a much
+bigger change than it looks: **any explicit plan pins the whole thing**
+(`mode=static`, `budget_src=config`) and the weather stops being consulted at all.
+You would keep your watt on a cold night and keep it on a 40 °C afternoon too.
+
+Two keys move one number each and leave the rest adaptive:
+
+| ambient | plain | `ADAPTIVE_CLAMP_OFFSET_W=1` | `ADAPTIVE_BUDGET_OFFSET_W=1` |
+|---|---|---|---|
+| 15 °C | `80:12.5 85:8` | `80:12.5 85:9` | `80:13 85:8` |
+| 20 °C | `80:12 85:7.5` | `80:12 85:8.5` | `80:12 85:7.5` |
+| 25 °C | `80:11 85:7` | `80:11 85:8` | `80:11 85:7` |
+| 30 °C | `80:10 85:6.5` | `80:10 85:7.5` | `80:10 85:6.5` |
+| 34 °C | constant 9 W, clamp 6.30 W | constant 9 W, clamp **7.30 W** | constant 9 W, clamp 6.30 W |
+
+**Neither is a floor.** Both are requests, trimmed by the physics that would
+otherwise be violated — and the two are bounded by *different* limits, which is why
+they behave so differently in that table.
+
+`ADAPTIVE_CLAMP_OFFSET_W` raises the emergency rung, bounded by the **release
+budget**: the power above which the rung settles the die above its own release
+temperature and can never let go. That was a measured failure — a clamp stuck for
+11 minutes in the field — so the offset is added *inside* that bound. There is
+usually room there, which is why the full watt lands at every row above.
+
+`ADAPTIVE_BUDGET_OFFSET_W` raises the working rung, and its bound is much tighter,
+because the working rung **settles the die by construction**: at budget B and
+ambient A the die comes to rest at `A + Rtheta × B`. Push B until that resting point
+reaches the emergency rung and the rung engages under ordinary load — the engine
+rejects such a ladder outright and falls back to a constant cap, which would cap the
+machine at *every* temperature and cost you the uncapped band under the first rung.
+Asking for more would end in less, so the request is trimmed instead.
+
+That bound is worth stating in watts, because it is small. All this key can ever hand
+you is the slack between the die target and the emergency rung:
+
+```
+(85 °C rung − 83 °C die target) ÷ 5.24 C/W = 0.38 W   on a 0.5 W quantisation step
+```
+
+So on this machine it yields **+0.5 W or nothing**, never the full watt, whatever you
+set it to — `+0.5 W` at 15/18/21/23/28 °C, nothing at 25 or 30 °C where the step
+boundary falls the wrong way. If you want more than that, no offset will do it: the
+lever is `DIE_TARGET_C`/`CRIT_C` (deciding to run the die hotter) or a genuinely lower
+`RTHETA_C_PER_W` (better cooling, measured rather than wished for).
+
+The watts it does hand you come out of `DIE_TARGET_MARGIN_C`, which covers
+package-versus-hottest-core error, die ripple and ambient error. A die that settled at
+80.9 °C now settles at 83.6 °C — still under the rung, with less room to wobble before
+the clamp fires, so expect more clamp episodes on a marginal day.
+[`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh) is how you check that.
+
+`--detect` and `--simulate` print the governing bound beside each request, so you can
+see how much of it actually landed:
+
+```
+  clamp offset             +1W asked for   (release budget here is 9.48W — the offset is trimmed to fit under it)
+  budget offset            +1W asked for   (the die must settle under the 85C rung, so at most 11.77W here)
+```
+
+Neither key changes when a clamp *releases*: that is set by the rung temperature and
+`TIER_HYSTERESIS`, not by watts. An 8.5 W clamp at the 85 °C rung still releases below
+78 °C, exactly as a 7 W one did.
+
 ### When it cannot reach the weather service
 
 **It fails safe, never optimistic.** Every one of these lands in the same place —
@@ -712,6 +779,8 @@ one costs you.
 | `LADDER_START_MARGIN_C` | `3` | First generated rung sits this far below the die target |
 | `LADDER_TOP_MARGIN_C` | `3` | Top generated rung sits this far below `CRIT_C`. This is your overshoot margin |
 | `LADDER_TOP_FACTOR` | `0.65` | Top-rung watts as a fraction of the budget, reduced further if the rung could not release |
+| `ADAPTIVE_CLAMP_OFFSET_W` | `0` | Watts added to the engine's emergency clamp, keeping the plan adaptive. Trimmed to whatever the release bound allows, so it is a request rather than a floor |
+| `ADAPTIVE_BUDGET_OFFSET_W` | `0` | Watts added to the working rung — the band between the first and emergency rungs. Ladder plans only, and trimmed to keep the die settling below the emergency rung, since a ladder that cannot hold becomes a constant cap |
 | `LADDER_MIN_WINDOW_C` | `8` | Minimum burst window before a ladder beats a flat cap. ±2 °C of hysteresis around it |
 | `LADDER_IDLE_RISE_C` | `0.45 × Rθ × stock` | Die rise above ambient at light load. Decides the crossover — worth measuring |
 | `WEATHER_URL` | Open-Meteo | `https://` only. Must return a `current` object with a numeric `temperature_2m` |
@@ -859,6 +928,7 @@ outside
   in window    : min 22.6C  max 25.5C   (7 update(s), 2 fallback(s))
 
 temperature
+  latest       : 71C   (last sample, 4s ago)
   min 61C   mean 68.0C   max 85C
   at or above 80C : 10m40s (4.5%)
   at or above 85C : 8s (0.1%)
@@ -892,6 +962,14 @@ which is not necessarily the one in force now: in the sample above the episode r
 11.5 W and the current plan is 10.5 W, because the afternoon warmed up by 3 °C and the
 engine stepped the budget down. A trace with no tier events shows `?` rather than
 guessing.
+
+`latest` is the newest sample in the trace, and it is always printed with its age
+because the age is what makes it safe to read. A trace that stopped three hours ago
+still has a newest sample, and on a machine you are looking at *because* it went down
+that is the normal case — `71C (last sample, 3h04m ago)` is a very different statement
+from `71C (last sample, 4s ago)`. The age is computed from the timestamps with
+`date -d`; where that is unavailable the absolute clock time is printed instead
+(`at 09:50:31`), because a wrong interval would be worse than none.
 
 Durations come from the timestamps, not from a sample count times an assumed
 `POLL_SEC` — the daemon can be restarted with a different interval, and a laptop can
@@ -1014,7 +1092,7 @@ suitable for a cron job or a login shell:
 ```
 == thermal-guard: last 24h of /var/log/thermal-trace.log ==
 active : 2026-08-08T09:50:31+03:00 RESULT v=1 ambient_c=22.6 ambient_src=weather ... mode=ladder budget_w=11.5 tiers=80:11.5,85:7
-temps  : mean 66.3C  peak 85C  2.1% clamped  (21548 samples)
+temps  : now 71C (4s ago)  mean 66.3C  peak 85C  2.1% clamped  (21548 samples)
 hot    : 5 samples at or above 85C  <- check what your machine actually misbehaves at
 plans  : 1 change(s), 2 ambient fallback(s)
 recent warnings:
@@ -1024,6 +1102,11 @@ recent warnings:
 It reads only the trace, so it also works on a machine where the daemon is not
 running, on a trace copied from another box, and — the case it is really for — after
 a power cut, when the trace is the only witness left.
+
+That last case is why the leading temperature names itself. `now 71C (4s ago)` is a
+live machine; once the newest sample is more than a minute old the word changes to
+`last 71C (3h04m ago)`, so a reading taken from a trace that stopped hours ago cannot
+be mistaken for the temperature right now.
 
 ---
 

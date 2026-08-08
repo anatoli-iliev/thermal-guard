@@ -1124,6 +1124,171 @@ then fail "no RESULT line ever mentions poweroff" "found one"
 else pass "no RESULT line ever mentions poweroff"; fi
 
 # ============================================================================
+group "9c. ADAPTIVE_CLAMP_OFFSET_W — a more generous emergency clamp"
+# ============================================================================
+# The engine derives the emergency clamp as LADDER_TOP_FACTOR x budget, and this
+# key adds watts to that. It is applied INSIDE the release bound, so what it
+# cannot do is as important as what it can: it must never buy a rung that the
+# machine cannot cool back out of, and it must never silently change the shape
+# of the plan. Both are asserted here, alongside the arithmetic.
+OFF0="$WORK/off0.conf"; mkconf "$OFF0" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=0'
+OFF1="$WORK/off1.conf"; mkconf "$OFF1" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=1'
+OFFBIG="$WORK/offbig.conf"; mkconf "$OFFBIG" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=99'
+
+# Default is zero, and zero is not a new code path: it must reproduce the
+# ground-truth ladder byte for byte.
+out=$(sim "$OFF0" ambient=25)
+assert_eq "offset 0 leaves the ground-truth ladder untouched" \
+          "80:11,85:7" "$(rfield tiers <<<"$out")"
+
+out=$(sim "$OFF1" ambient=25)
+assert_eq "offset +1W raises the emergency rung 7W -> 8W"  "80:11,85:8" "$(rfield tiers <<<"$out")"
+assert_eq "offset +1W reports the raised clamp in clamp_w" "8"          "$(rfield clamp_w <<<"$out")"
+assert_eq "offset +1W leaves the working rung alone"       "11"         "$(rfield budget_w <<<"$out")"
+assert_eq "offset +1W does not change the plan shape"      ladder       "$(rfield mode <<<"$out")"
+assert_eq "offset +1W does not change the plan reason"     window-ok    "$(rfield reason <<<"$out")"
+
+# The safety property. 99W cannot be honoured: the rung would settle the die
+# above its own release point and could never let go — the measured failure the
+# release bound exists to prevent. It must be trimmed, not obeyed, and the
+# ladder must survive rather than collapsing to a constant cap.
+out=$(sim "$OFFBIG" ambient=25)
+assert_eq "an impossible offset still yields a ladder, not a collapse" ladder "$(rfield mode <<<"$out")"
+big_clamp=$(rfield clamp_w <<<"$out")
+# release budget = (first rung 80C - hysteresis 7C - ambient 25C) / Rtheta 5.24
+assert_le "the trimmed rung stays within the release budget (9.16W)" "$big_clamp" 9.16
+settle=$(awk -v w="$big_clamp" 'BEGIN{printf "%.2f", 25 + 5.24*w}')
+assert_le "the trimmed rung still cools back below its release point (73C)" "$settle" 73
+
+# A constant-cap plan derives a clamp too, and the same key governs it.
+outc=$(sim "$OFF0" ambient=40); outo=$(sim "$OFF1" ambient=40)
+if [[ "$(rfield mode <<<"$outc")" == constant ]]; then
+  d=$(awk -v a="$(rfield clamp_w <<<"$outc")" -v b="$(rfield clamp_w <<<"$outo")" 'BEGIN{printf "%.2f", b-a}')
+  assert_eq "the offset reaches the constant-cap clamp as well" "1.00" "$d"
+else
+  skip "the offset reaches the constant-cap clamp as well" "no constant plan at 40C on this fixture"
+fi
+
+BADOFF="$WORK/badoff.conf"; mkconf "$BADOFF" 'ADAPTIVE=yes' 'ADAPTIVE_CLAMP_OFFSET_W=abc'
+out=$(sim "$BADOFF" ambient=25); rc=$(lastrc)
+if (( rc != 0 )) && [[ "$out" == *ADAPTIVE_CLAMP_OFFSET_W* ]]
+then pass "a non-numeric offset is refused by name"
+else fail "a non-numeric offset is refused by name" "rc=$rc out=[$out]"; fi
+
+# ============================================================================
+group "9d. ADAPTIVE_BUDGET_OFFSET_W — a wider band between the rungs"
+# ============================================================================
+# Widens the working rung, the band between the first rung and the emergency one.
+# Its bound is stricter than the clamp offset's: the working rung settles the die
+# by construction, so a budget that settles ON the emergency rung would engage
+# that rung under ordinary load. The engine already rejects such a ladder and
+# falls back to a constant cap — which would cap the machine at every temperature
+# and remove the uncapped band this key exists to protect. So asking for too much
+# must yield less, not collapse. Ambient 21C is used because it has headroom
+# under the settle bound; at 25C the bound is already binding and the correct
+# answer is that nothing moves.
+BOFF0="$WORK/boff0.conf"; mkconf "$BOFF0" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=0'
+BOFF1="$WORK/boff1.conf"; mkconf "$BOFF1" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=1'
+BOFFBIG="$WORK/boffbig.conf"; mkconf "$BOFFBIG" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=99'
+
+assert_eq "budget offset 0 leaves the ground-truth ladder untouched" \
+          "80:11,85:7" "$(rfield tiers <<<"$(sim "$BOFF0" ambient=25)")"
+
+out=$(sim "$BOFF1" ambient=21)
+assert_eq "budget +1W widens the working rung 11.5W -> 12W" "12"     "$(rfield budget_w <<<"$out")"
+assert_eq "budget +1W keeps the plan a ladder"              ladder   "$(rfield mode <<<"$out")"
+assert_contains "budget +1W leaves everything under the first rung uncapped" \
+                "$(sim "$BOFF1" ambient=21)" "baseline stock"
+
+# The settle bound, which is the whole safety story for this key.
+out=$(sim "$BOFFBIG" ambient=21)
+assert_eq "an impossible budget offset still yields a ladder, not a constant cap" \
+          ladder "$(rfield mode <<<"$out")"
+bw=$(rfield budget_w <<<"$out")
+settle=$(awk -v b="$bw" 'BEGIN{printf "%.2f", 21 + 5.24*b}')
+# rungtop = CRIT_C 88 - LADDER_TOP_MARGIN_C 3 = 85C. Strictly under, never equal:
+# the settle rejection tests >=, so landing exactly on it would collapse the plan.
+if awk -v s="$settle" 'BEGIN{exit !(s < 85)}'
+then pass "the widened rung still settles strictly below the 85C rung (${settle}C)"
+else fail "the widened rung still settles strictly below the 85C rung" "settles at ${settle}C"; fi
+
+# Ladder plans only: a constant cap has no band between rungs to widen.
+c0=$(sim "$BOFF0" ambient=40); c1=$(sim "$BOFF1" ambient=40)
+if [[ "$(rfield mode <<<"$c0")" == constant ]]; then
+  assert_eq "a constant-cap plan is left alone by the budget offset" \
+            "$(rfield budget_w <<<"$c0")" "$(rfield budget_w <<<"$c1")"
+else
+  skip "a constant-cap plan is left alone by the budget offset" "no constant plan at 40C on this fixture"
+fi
+
+BADB="$WORK/badboff.conf"; mkconf "$BADB" 'ADAPTIVE=yes' 'ADAPTIVE_BUDGET_OFFSET_W=-3'
+out=$(sim "$BADB" ambient=25); rc=$(lastrc)
+if (( rc != 0 )) && [[ "$out" == *ADAPTIVE_BUDGET_OFFSET_W* ]]
+then pass "a negative budget offset is refused by name"
+else fail "a negative budget offset is refused by name" "rc=$rc out=[$out]"; fi
+
+# ============================================================================
+group "9b. contrib tools — the newest sample, and how old it is"
+# ============================================================================
+# Both reporting scripts print the most recent temperature in the trace. That
+# figure is misleading without its age: a trace that stopped hours ago still has
+# a newest sample, and that is the normal state in the case these tools exist for
+# — a machine read after it went down. So the wording is asserted for a fresh
+# trace and a stale one, and for a machine whose date(1) cannot compute the gap
+# at all. Synthetic traces throughout: no daemon, no sensor, no root.
+if ! date -d "@0" '+%Y-%m-%dT%H:%M:%S%:z' >/dev/null 2>&1; then
+  skip "contrib tools report the newest sample and its age" \
+       "building the fixture needs GNU date -d, which this machine does not have"
+else
+  mktrace() {          # mktrace FILE SECONDS_AGO LAST_TEMP
+    local f=$1 endago=$2 last=$3 s e n
+    n=$(date +%s); e=$(( n - endago ))
+    printf '# %s RESULT v=1 mode=ladder budget_w=11.5 tiers=80:11.5,85:7 clamp_w=-\n' \
+      "$(date -d "@$(( e - 120 ))" '+%Y-%m-%dT%H:%M:%S%:z')" > "$f"
+    for (( s = e - 120; s < e; s += 2 )); do
+      printf '%s,67,0\n' "$(date -d "@$s" '+%Y-%m-%dT%H:%M:%S%:z')" >> "$f"
+    done
+    printf '%s,%s,0\n' "$(date -d "@$e" '+%Y-%m-%dT%H:%M:%S%:z')" "$last" >> "$f"
+  }
+
+  FRESH="$WORK/trace-fresh.log"; mktrace "$FRESH" 4     71
+  STALE="$WORK/trace-stale.log"; mktrace "$STALE" 11040 66     # stopped 3h04m back
+
+  out=$("$ROOT/contrib/thermal-summary.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "thermal-summary prints the newest temperature"        "$out" "temps  : now 71C ("
+  assert_contains "thermal-summary prints how old that reading is"       "$out" "ago)"
+
+  out=$("$ROOT/contrib/thermal-clamps.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "thermal-clamps prints the newest temperature"         "$out" "latest       : 71C   (last sample, "
+
+  # The word carries the claim: on a trace that stopped hours ago, nothing may
+  # call itself "now". This is the assertion that matters after a power cut.
+  out=$("$ROOT/contrib/thermal-summary.sh" 24 -f "$STALE" 2>&1)
+  assert_contains     "a stale trace is reported as 'last', not 'now'"   "$out" "temps  : last 66C ("
+  assert_not_contains "a stale trace never calls its newest sample 'now'" "$out" "temps  : now"
+
+  # No date -d: print the absolute clock time rather than invent an interval.
+  NODATE="$WORK/nodate"; mkdir -p "$NODATE"
+  REALDATE=$(command -v date)
+  cat > "$NODATE/date" <<EOF
+#!/bin/sh
+# Test stub: a date(1) with no -d support, as on a busybox userland.
+case "\$1" in -d) exit 1 ;; esac
+exec "$REALDATE" "\$@"
+EOF
+  chmod +x "$NODATE/date"
+  out=$(PATH="$NODATE:$PATH" "$ROOT/contrib/thermal-summary.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "without date -d, thermal-summary prints a clock time not a guess" \
+                  "$out" "temps  : last 71C (at "
+fi
+
+# ============================================================================
 group "10. hermeticity — the whole suite, end to end"
 # ============================================================================
 if [[ -e "$NETMARK" ]]; then
