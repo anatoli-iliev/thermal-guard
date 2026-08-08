@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION=1.1.0
+VERSION=1.2.0
 PROGNAME=${0##*/}
 CONFIG=${THERMAL_GUARD_CONFIG:-/etc/thermal-guard.conf}
 STATE_DIR=${THERMAL_GUARD_STATE:-/var/lib/thermal-guard}
@@ -43,6 +43,53 @@ RESTORE_ON_EXIT=yes        # put hardware back to stock when stopped cleanly
 TRACE=/var/log/thermal-trace.log
 TRACE_MAX_BYTES=$((32*1024*1024))
 
+# ------------------------------------------------- weather-adaptive budget ----
+# A power budget that is right indoors in winter is wrong on a balcony in August,
+# because the die settles at ambient + Rtheta * watts and only one of those three
+# terms is under our control. With ADAPTIVE=yes the daemon fetches the outdoor
+# temperature once an hour, estimates the ambient at the machine, and solves that
+# equation for the watts that land the die on a target below CRIT_C.
+#
+# ADAPTIVE=no is not a code path that does nothing: none of it is entered at all.
+# No network, no state files, no derived values — v1.1 behaviour byte for byte.
+ADAPTIVE=no                # master switch
+PLACEMENT=indoor           # indoor | outdoor — where the machine physically sits
+LOCATION=""                # auto | "lat,lon". Place names are NOT accepted.
+AMBIENT_OFFSET_C=0         # trim added to the derived ambient; the first knob to reach for
+
+ADAPTIVE_MODE=auto         # auto | ladder | constant — force the plan shape
+LATITUDE=""                # explicit coordinates always beat LOCATION
+LONGITUDE=""
+AMBIENT_C=""               # fixed ambient at the machine; setting it suppresses ALL network use
+AMBIENT_FALLBACK_C=35      # ambient assumed when the real one is unknown — must be HOT
+RTHETA_C_PER_W=""          # degrees the die rises per watt. Empty = derived. Measure it.
+DIE_TARGET_C=""            # empty = CRIT_C - DIE_TARGET_MARGIN_C
+BUDGET_MIN_W=""            # usability floor. Empty = max(4, 25% of stock)
+BUDGET_MAX_W=""            # empty = the detected stock limit
+INDOOR_BASE_C=22           # what a heated/cooled building sits at
+INDOOR_COUPLING=0.35       # how much of the outdoor excess above INDOOR_BASE_C reaches the room
+
+DIE_TARGET_MARGIN_C=5      # 1C package-vs-hottest-core + 2C die ripple + 2C ambient error
+RTHETA_DERATE=1.4          # how much worse than its design point to assume the cooling is
+BUDGET_STEP_W=0.5          # quantisation, always rounded DOWN; also acts as the deadband
+LADDER_START_MARGIN_C=3    # first rung sits this far below DIE_TARGET_C
+LADDER_TOP_MARGIN_C=3      # top (emergency) rung sits this far below CRIT_C
+LADDER_TOP_FACTOR=0.65     # top-rung watts as a fraction of the working budget
+LADDER_MIN_WINDOW_C=8      # burst window below the first rung before a ladder beats a flat cap
+LADDER_IDLE_RISE_C=""      # die rise above ambient at light load. Empty = 0.45 x Rtheta x stock
+WEATHER_URL=""             # empty = the built-in Open-Meteo endpoint
+GEOIP_URL=""               # empty = the built-in GeoJS endpoint; only used by LOCATION=auto
+WEATHER_INTERVAL_SEC=3600
+WEATHER_TIMEOUT_SEC=10
+WEATHER_MAX_AGE_SEC=10800  # beyond this age a cached reading counts as unknown
+ADAPTIVE_HEARTBEAT_SEC=900 # restate the active plan in the trace this often, 0 = off
+
+# Both free, both keyless, both verified reachable. The {lat}/{lon} placeholders
+# are only ever substituted with numbers that passed a range check, and the
+# finished URL is only ever handed to curl/wget as one quoted argv element.
+WEATHER_URL_DEFAULT='https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m'
+GEOIP_URL_DEFAULT='https://get.geojs.io/v1/ip/geo.json'
+
 # --version and --help must work ANYWHERE: no config, no sensors, no root, inside a
 # container. Handle them before touching the config or the hardware, or they break
 # on exactly the machines where someone is trying to find out what this thing is.
@@ -53,11 +100,24 @@ case "${1:-}" in
     cat <<EOF
 thermal-guard $VERSION — CPU thermal envelope guard with crash-surviving telemetry
 
-usage: $PROGNAME [--detect | --version | --help]
+usage: $PROGNAME [--detect | --simulate ARG | --version | --help]
 
   (no args)   run the guard loop (normally started by systemd)
   --detect    print detected hardware and effective configuration, then exit
+  --simulate  show the budget the adaptive engine would pick for a given
+              temperature. Writes no hardware register and uses no network:
+                --simulate 34           an OUTDOOR reading of 34C
+                --simulate ambient=25   the ambient AT THE MACHINE is 25C
+                --simulate unknown      the fail-safe path, no trusted ambient
   --version   print the version
+
+testing
+  --selftest-parse         read a weather body on stdin, print the temperature
+                           it accepts, or print nothing and exit 1
+  \$THERMAL_GUARD_CONFIG    config path
+  \$THERMAL_GUARD_STATE     state directory
+  \$THERMAL_GUARD_ASSUME_TJMAX_C, \$THERMAL_GUARD_ASSUME_STOCK_W
+                           stand in for hardware that is not present
 
 config : $CONFIG  (override with \$THERMAL_GUARD_CONFIG)
 state  : $STATE_DIR
@@ -75,6 +135,18 @@ if [[ -e "$CONFIG" ]]; then
   fi
 fi
 
+# What the user actually wrote, captured before anything below derives a value
+# into the same variable. The adaptive engine only ever fills in a plan that was
+# left empty, so it has to be able to tell "empty" from "derived to the same
+# thing"; and the CRIT_C warning has to know whether CRIT_C is an observed death
+# point or a guess off Tjmax.
+CRIT_C_FROM_CONFIG=$CRIT_C
+NORMAL_WATTS_FROM_CONFIG=$NORMAL_WATTS
+TIERS_FROM_CONFIG=$TIERS
+CLAMP_WATTS_FROM_CONFIG=$CLAMP_WATTS
+DIE_TARGET_FROM_CONFIG=$DIE_TARGET_C
+TIER_HYSTERESIS_CFG=$TIER_HYSTERESIS
+
 PSTATE=/sys/devices/system/cpu/intel_pstate
 
 # ============================================================ validation ======
@@ -85,6 +157,18 @@ die() { echo "$PROGNAME: $*" >&2; exit 78; }
 is_num()  { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 is_int()  { [[ "$1" =~ ^[0-9]+$ ]]; }
 is_temp() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
+is_dec()  { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; }
+# Ranges go through awk because these are decimals and bash cannot compare them.
+num_in()  { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN{exit !(v>=lo && v<=hi)}'; }
+
+# https only. A plaintext channel deciding a power budget is not acceptable and
+# excluding it deletes a whole branch of the threat model. The character
+# allowlist has no whitespace, backtick, quote, backslash, pipe or angle
+# brackets in it, so nothing that survives this can be mistaken for shell.
+is_url() {
+  local re='^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%{}-]+$'
+  [[ "$1" =~ $re ]]
+}
 
 is_num "$POLL_SEC" && awk -v v="$POLL_SEC" 'BEGIN{exit !(v>0)}' \
   || die "POLL_SEC must be a positive number (got '$POLL_SEC')"
@@ -92,7 +176,7 @@ is_int "$CRIT_SAMPLES" && (( CRIT_SAMPLES >= 1 )) \
   || die "CRIT_SAMPLES must be an integer >= 1 (got '$CRIT_SAMPLES')"
 is_int "$CLAMP_PERF_PCT" && (( CLAMP_PERF_PCT >= 1 && CLAMP_PERF_PCT <= 100 )) \
   || die "CLAMP_PERF_PCT must be 1-100 (got '$CLAMP_PERF_PCT')"
-for v in NORMAL_WATTS CLAMP_WATTS; do
+for v in NORMAL_WATTS CLAMP_WATTS BUDGET_MIN_W BUDGET_MAX_W BUDGET_STEP_W; do
   [[ -z "${!v}" ]] && continue
   is_num "${!v}" || die "$v must be a number in watts, decimals allowed (got '${!v}')"
   awk -v x="${!v}" 'BEGIN{exit !(x>0)}' || die "$v must be greater than zero (got '${!v}')"
@@ -111,6 +195,84 @@ is_int "$TIER_SAMPLES" && (( TIER_SAMPLES >= 1 )) \
   || die "TIER_SAMPLES must be an integer >= 1 (got '$TIER_SAMPLES')"
 is_int "$TIER_HYSTERESIS" && (( TIER_HYSTERESIS >= 1 )) \
   || die "TIER_HYSTERESIS must be an integer >= 1 (got '$TIER_HYSTERESIS')"
+
+# --- adaptive keys ---------------------------------------------------------
+# Syntax is checked whether or not ADAPTIVE=yes: a typo in a key should be caught
+# the moment it is written, not on the day the feature is finally switched on.
+# The checks that need a resolved CRIT_C or Tjmax live in the detection section.
+case "$ADAPTIVE" in yes|no) ;; *) die "ADAPTIVE must be yes or no (got '$ADAPTIVE')" ;; esac
+case "$ADAPTIVE_MODE" in auto|ladder|constant) ;; *)
+  die "ADAPTIVE_MODE must be auto, ladder or constant (got '$ADAPTIVE_MODE')" ;;
+esac
+case "$PLACEMENT" in indoor|outdoor) ;; *)
+  die "PLACEMENT must be indoor or outdoor (got '$PLACEMENT')" ;;
+esac
+is_int "$ADAPTIVE_HEARTBEAT_SEC" \
+  || die "ADAPTIVE_HEARTBEAT_SEC must be an integer >= 0, 0 to disable (got '$ADAPTIVE_HEARTBEAT_SEC')"
+
+loc_re='^(-?[0-9]+(\.[0-9]+)?),[[:space:]]*(-?[0-9]+(\.[0-9]+)?)$'
+loc_msg="LOCATION must be auto or \"lat,lon\" in decimal degrees (got '$LOCATION') — place names are not supported; see the config file for how to find your coordinates"
+case "$LOCATION" in
+  ""|auto) ;;
+  *) [[ "$LOCATION" =~ $loc_re ]] || die "$loc_msg"
+     num_in "${BASH_REMATCH[1]}" -90 90   || die "$loc_msg"
+     num_in "${BASH_REMATCH[3]}" -180 180 || die "$loc_msg" ;;
+esac
+[[ -z "$LATITUDE"  ]] || { is_dec "$LATITUDE"  && num_in "$LATITUDE"  -90 90; }   \
+  || die "LATITUDE must be a number between -90 and 90 (got '$LATITUDE')"
+[[ -z "$LONGITUDE" ]] || { is_dec "$LONGITUDE" && num_in "$LONGITUDE" -180 180; } \
+  || die "LONGITUDE must be a number between -180 and 180 (got '$LONGITUDE')"
+[[ -z "$AMBIENT_C" ]] || { is_dec "$AMBIENT_C" && num_in "$AMBIENT_C" -60 70; } \
+  || die "AMBIENT_C must be a temperature between -60 and 70 (got '$AMBIENT_C')"
+is_dec "$AMBIENT_FALLBACK_C" && num_in "$AMBIENT_FALLBACK_C" 0 60 \
+  || die "AMBIENT_FALLBACK_C must be a temperature between 0 and 60 (got '$AMBIENT_FALLBACK_C')"
+is_dec "$AMBIENT_OFFSET_C" && num_in "$AMBIENT_OFFSET_C" -30 30 \
+  || die "AMBIENT_OFFSET_C must be a number between -30 and 30 (got '$AMBIENT_OFFSET_C')"
+is_dec "$INDOOR_BASE_C" && num_in "$INDOOR_BASE_C" -20 40 \
+  || die "INDOOR_BASE_C must be a temperature between -20 and 40 (got '$INDOOR_BASE_C')"
+is_dec "$INDOOR_COUPLING" && num_in "$INDOOR_COUPLING" 0 1 \
+  || die "INDOOR_COUPLING must be a number between 0 and 1 (got '$INDOOR_COUPLING')"
+[[ -z "$RTHETA_C_PER_W" ]] || { is_num "$RTHETA_C_PER_W" && num_in "$RTHETA_C_PER_W" 0.1 30; } \
+  || die "RTHETA_C_PER_W must be a number between 0.1 and 30 degrees C per watt (got '$RTHETA_C_PER_W')"
+is_num "$RTHETA_DERATE" && num_in "$RTHETA_DERATE" 1.0 3.0 \
+  || die "RTHETA_DERATE must be a number between 1.0 and 3.0 — 1.0 means the cooling is as designed (got '$RTHETA_DERATE')"
+[[ -z "$DIE_TARGET_C" ]] || is_temp "$DIE_TARGET_C" \
+  || die "DIE_TARGET_C must be a whole number of degrees C (got '$DIE_TARGET_C')"
+is_int "$DIE_TARGET_MARGIN_C" && (( DIE_TARGET_MARGIN_C >= 1 && DIE_TARGET_MARGIN_C <= 40 )) \
+  || die "DIE_TARGET_MARGIN_C must be an integer between 1 and 40 (got '$DIE_TARGET_MARGIN_C')"
+is_int "$LADDER_START_MARGIN_C" && (( LADDER_START_MARGIN_C >= 1 )) \
+  || die "LADDER_START_MARGIN_C must be an integer >= 1 (got '$LADDER_START_MARGIN_C')"
+is_int "$LADDER_TOP_MARGIN_C" && (( LADDER_TOP_MARGIN_C >= 1 )) \
+  || die "LADDER_TOP_MARGIN_C must be an integer >= 1 (got '$LADDER_TOP_MARGIN_C')"
+is_num "$LADDER_TOP_FACTOR" && awk -v x="$LADDER_TOP_FACTOR" 'BEGIN{exit !(x>0 && x<=1)}' \
+  || die "LADDER_TOP_FACTOR must be greater than 0 and at most 1 (got '$LADDER_TOP_FACTOR')"
+is_num "$LADDER_MIN_WINDOW_C" \
+  || die "LADDER_MIN_WINDOW_C must be a number >= 0 (got '$LADDER_MIN_WINDOW_C')"
+[[ -z "$LADDER_IDLE_RISE_C" ]] || is_num "$LADDER_IDLE_RISE_C" \
+  || die "LADDER_IDLE_RISE_C must be a number >= 0 (got '$LADDER_IDLE_RISE_C')"
+[[ -z "$WEATHER_URL" ]] || is_url "$WEATHER_URL" \
+  || die "WEATHER_URL must be an https:// URL with no shell metacharacters (got '$WEATHER_URL')"
+[[ -z "$GEOIP_URL" ]] || is_url "$GEOIP_URL" \
+  || die "GEOIP_URL must be an https:// URL with no shell metacharacters (got '$GEOIP_URL')"
+is_int "$WEATHER_INTERVAL_SEC" && (( WEATHER_INTERVAL_SEC >= 600 )) \
+  || die "WEATHER_INTERVAL_SEC must be an integer >= 600 — fetching a free weather service more often than every 10 minutes buys nothing and is not neighbourly (got '$WEATHER_INTERVAL_SEC')"
+is_int "$WEATHER_TIMEOUT_SEC" && (( WEATHER_TIMEOUT_SEC >= 1 && WEATHER_TIMEOUT_SEC <= 120 )) \
+  || die "WEATHER_TIMEOUT_SEC must be an integer between 1 and 120 (got '$WEATHER_TIMEOUT_SEC')"
+is_int "$WEATHER_MAX_AGE_SEC" && (( WEATHER_MAX_AGE_SEC >= WEATHER_INTERVAL_SEC )) \
+  || die "WEATHER_MAX_AGE_SEC must be an integer >= WEATHER_INTERVAL_SEC ($WEATHER_INTERVAL_SEC) — otherwise every reading is stale before the next fetch could arrive (got '$WEATHER_MAX_AGE_SEC')"
+
+# Contradictions between keys the user typed. These do not need ADAPTIVE=yes to
+# be wrong, and none of them can fire on a config that sets no adaptive keys.
+[[ -n "$LATITUDE" && -z "$LONGITUDE" ]] \
+  && die "LATITUDE is set but LONGITUDE is empty — set both or neither"
+[[ -n "$LONGITUDE" && -z "$LATITUDE" ]] \
+  && die "LONGITUDE is set but LATITUDE is empty — set both or neither"
+if [[ -n "$BUDGET_MIN_W" && -n "$BUDGET_MAX_W" ]]; then
+  awk -v a="$BUDGET_MIN_W" -v b="$BUDGET_MAX_W" 'BEGIN{exit !(a<=b)}' \
+    || die "BUDGET_MIN_W ($BUDGET_MIN_W) is above BUDGET_MAX_W ($BUDGET_MAX_W) — the budget band is empty"
+fi
+
+ADAPTIVE_ON=0; [[ "$ADAPTIVE" == yes ]] && ADAPTIVE_ON=1
 
 # ============================================================= detection ======
 # Resolve everything by NAME, never by index. hwmon* and thermal_zone* numbering
@@ -177,6 +339,12 @@ TJMAX=$(find_tjmax) || { TJMAX=100; TJMAX_DETECTED=no; }
 RAPL=$(find_rapl_package) || RAPL=""
 RAPL_COUNT=$(count_rapl_packages)
 
+# Test hook, never a config key: it only stands in for a Tjmax the hardware did
+# not give us, so it cannot override a real reading on a real machine.
+if [[ "$TJMAX_DETECTED" == no && -n "${THERMAL_GUARD_ASSUME_TJMAX_C:-}" ]]; then
+  is_int "${THERMAL_GUARD_ASSUME_TJMAX_C}" && TJMAX=$THERMAL_GUARD_ASSUME_TJMAX_C
+fi
+
 [[ -z "$WARN_C"    ]] && WARN_C=$((  TJMAX - 10 ))
 [[ -z "$CRIT_C"    ]] && CRIT_C=$((  TJMAX - 5  ))
 [[ -z "$RECOVER_C" ]] && RECOVER_C=$(( WARN_C - 7 ))
@@ -214,6 +382,194 @@ elif [[ -n "$CLAMP_WATTS" ]]; then
   LEGACY_MODE=yes
 fi
 : "${LEGACY_MODE:=no}"
+
+# ------------------------------------------------- adaptive: derivation ----
+# Everything the engine needs that is a property of the machine rather than of
+# the weather, resolved once. None of it is computed when ADAPTIVE=no, so a
+# config without the feature does not so much as stat the state directory here.
+STOCK_W=15; STOCK_SRC=default
+STOCK_RATING_UW=""         # the hardware's published rating, if it publishes one
+STOCK_SAVED_W=""           # what the snapshot holds, for the mismatch warning
+RTHETA=""; RTHETA_SRC="-"; RTHETA_OUT="-"
+RUNG1_T=0; RUNGTOP_T=0
+WINDOW_MIN_OUT="-"
+BUDGET_MAX_SRC=config; BUDGET_MIN_SRC=config; IDLE_RISE_SRC=config
+HAVE_CURL=0; HAVE_WGET=0; HAVE_TIMEOUT=0
+declare -a ADAPTIVE_NOTES=()
+
+# What this CPU is RATED to sustain. Three things derive from it — the default
+# BUDGET_MAX_W ceiling, the light-load idle rise, and the engine's uncapped
+# baseline — so getting it wrong is not a cosmetic error, it quietly wrongs the
+# whole plan in the same direction at once.
+#
+# Ask the hardware first. constraint_0_max_power_uw is the ceiling the firmware
+# publishes for that constraint, and unlike the live limit it does not move when
+# we cap the package.
+#
+# The saved snapshot is NOT a rating and must not be treated as one. It is a copy
+# of the live register taken on the first ever run, so a first run that happened
+# while an earlier experiment had the package capped records that cap as though
+# the machine shipped with it — and never self-corrects, because the file is only
+# ever written once. That is not hypothetical: on the author's 17 W i5-3317U the
+# snapshot held 11 W and silently held the ceiling, the idle-rise estimate and the
+# ladder's burst headroom at 11 W for every run thereafter. The snapshot keeps its
+# real job, which is knowing what to put back on exit.
+#
+# Sets STOCK_W and STOCK_SRC rather than printing, because WHERE the number came
+# from matters as much as the number. --detect prints both, so it can be argued with.
+find_stock_watts() {
+  local uw="" f="$STATE_DIR/stock-power-limit-uw" src="" m=""
+  if [[ -r "$f" ]]; then
+    m=$(<"$f")
+    [[ "$m" =~ ^[0-9]+$ ]] && (( m > 0 )) \
+      && STOCK_SAVED_W=$(awk -v u="$m" 'BEGIN{printf "%g", u/1000000}')
+  fi
+  # An explicit override beats detection, and must, for two reasons. The test
+  # suite pins the rating so its physics assertions produce the same numbers on a
+  # bare CI runner and on a developer laptop that really does have RAPL — before
+  # this took precedence, a laptop whose firmware published a different rating
+  # silently rewrote every ground-truth figure. And some firmware simply reports a
+  # wrong rating, which otherwise leaves no way to correct it.
+  if is_num "${THERMAL_GUARD_ASSUME_STOCK_W:-}" \
+     && awk -v x="${THERMAL_GUARD_ASSUME_STOCK_W}" 'BEGIN{exit !(x>0)}'; then
+    STOCK_W=$THERMAL_GUARD_ASSUME_STOCK_W; STOCK_SRC='$THERMAL_GUARD_ASSUME_STOCK_W'
+    STOCK_RATING_UW=$(awk -v w="$STOCK_W" 'BEGIN{printf "%d", w*1000000}')
+    return 0
+  fi
+  if [[ -n "$RAPL" && -r "$RAPL/constraint_0_max_power_uw" ]]; then
+    m=$(<"$RAPL/constraint_0_max_power_uw")
+    if [[ "$m" =~ ^[0-9]+$ ]] && (( m > 0 )); then
+      uw=$m; STOCK_RATING_UW=$m
+      src="hardware rating $RAPL/constraint_0_max_power_uw"
+    fi
+  fi
+  if   [[ -n "$uw" ]]; then :
+  elif [[ -r "$f" ]];  then uw=$(<"$f"); src="saved state $f"
+  elif [[ -n "$RAPL" && -r "$RAPL/constraint_0_power_limit_uw" ]]; then
+    uw=$(<"$RAPL/constraint_0_power_limit_uw"); src="live RAPL register"
+  fi
+  if [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )); then
+    STOCK_W=$(awk -v u="$uw" 'BEGIN{printf "%g", u/1000000}'); STOCK_SRC=$src; return 0
+  fi
+  if is_num "${THERMAL_GUARD_ASSUME_STOCK_W:-}" \
+     && awk -v x="${THERMAL_GUARD_ASSUME_STOCK_W}" 'BEGIN{exit !(x>0)}'; then
+    STOCK_W=$THERMAL_GUARD_ASSUME_STOCK_W; STOCK_SRC='$THERMAL_GUARD_ASSUME_STOCK_W'; return 0
+  fi
+  STOCK_W=15; STOCK_SRC='no RAPL and no saved state — assumed'
+  return 0
+}
+
+if (( ADAPTIVE_ON )); then
+  find_stock_watts
+
+  if [[ -n "$RTHETA_C_PER_W" ]]; then
+    RTHETA=$RTHETA_C_PER_W; RTHETA_SRC=config
+  else
+    # Design point, not a magic number: "sustain the stock power limit with the
+    # die at Tjmax-15, in a 25C room", then assume the cooling is RTHETA_DERATE
+    # worse than that. On the reference machine it lands at 5.35 against a
+    # measured 5.24 — close enough that both field anchors survive it.
+    RTHETA=$(awk -v tj="$TJMAX" -v s="$STOCK_W" -v d="$RTHETA_DERATE" \
+      'BEGIN{ r=(tj-15-25)/s*d; if(r<0.1) r=0.1; if(r>30) r=30; printf "%.4f", r }')
+    RTHETA_SRC=derived
+  fi
+  RTHETA_OUT=$(awk -v r="$RTHETA" 'BEGIN{printf "%.2f", r}')
+
+  if [[ -z "$DIE_TARGET_C" ]]; then DIE_TARGET_C=$(( CRIT_C - DIE_TARGET_MARGIN_C )); fi
+  if [[ -z "$BUDGET_MAX_W" ]]; then BUDGET_MAX_W=$STOCK_W; BUDGET_MAX_SRC=stock; fi
+  if [[ -z "$BUDGET_MIN_W" ]]; then
+    BUDGET_MIN_W=$(awk -v s="$STOCK_W" 'BEGIN{v=0.25*s; if(v<4)v=4; printf "%g", v}')
+    BUDGET_MIN_SRC=derived
+  fi
+  if [[ -z "$LADDER_IDLE_RISE_C" ]]; then
+    # 0.45 is measured, not chosen: idle package power is 0.27 of stock and idle
+    # Rtheta is 1.66x the loaded figure because the fan is not spinning.
+    LADDER_IDLE_RISE_C=$(awk -v r="$RTHETA" -v s="$STOCK_W" 'BEGIN{printf "%.4f", 0.45*r*s}')
+    IDLE_RISE_SRC=derived
+  fi
+  WINDOW_MIN_OUT=$(awk -v v="$LADDER_MIN_WINDOW_C" 'BEGIN{printf "%.1f", v}')
+  RUNG1_T=$((   DIE_TARGET_C - LADDER_START_MARGIN_C ))
+  RUNGTOP_T=$(( CRIT_C       - LADDER_TOP_MARGIN_C   ))
+
+  # A ceiling the user typed is the user's. It is NOT clipped to the detected
+  # stock limit, because "detected" can be a stale cap: on the machine this tool
+  # was written for the state file records 11 W, the cap from an old experiment,
+  # against a part rated 17 W — so clipping would silently throw away the very
+  # number the config was written to pin. Say loudly which figure won instead.
+  # (When BUDGET_MAX_W is derived it IS the stock limit, so this can only ever
+  # fire on a value someone typed.)
+  if awk -v a="$BUDGET_MAX_W" -v b="$STOCK_W" 'BEGIN{exit !(a>b)}'; then
+    ADAPTIVE_NOTES+=("warning: BUDGET_MAX_W (${BUDGET_MAX_W}W) is above the stock power limit this run detected (${STOCK_W}W, from $STOCK_SRC) — your ${BUDGET_MAX_W}W is what the engine uses. If ${STOCK_W}W is not your CPU's rating that reading is stale, and LADDER_IDLE_RISE_C is derived from it too")
+  fi
+  # A snapshot below the rating means an earlier run saved the register while the
+  # package was already capped. Harmless for the engine, which now reads the
+  # rating from the hardware — but restore-on-exit still puts the snapshot back,
+  # so `systemctl stop` would leave the CPU at that old cap. Name the file and the
+  # remedy; a warning that does not say what to do is just noise.
+  if [[ -n "$STOCK_RATING_UW" && -n "$STOCK_SAVED_W" ]] \
+     && awk -v s="$STOCK_SAVED_W" -v r="$STOCK_W" 'BEGIN{exit !(s<r)}'; then
+    ADAPTIVE_NOTES+=("note: the saved stock snapshot (${STOCK_SAVED_W}W, $STATE_DIR/stock-power-limit-uw) is below this CPU's rating (${STOCK_W}W). The engine uses the rating, so budgets are unaffected — but stopping the service would restore ${STOCK_SAVED_W}W. To correct it: systemctl stop thermal-guard, rm that file, then start again")
+  fi
+  # A derived floor above a derived ceiling means a machine whose stock limit is
+  # under 4 W. Clamp rather than refuse: nothing the user typed is wrong.
+  if awk -v a="$BUDGET_MIN_W" -v b="$BUDGET_MAX_W" 'BEGIN{exit !(a>b)}'; then
+    BUDGET_MIN_W=$BUDGET_MAX_W; BUDGET_MIN_SRC=clamped
+  fi
+  if awk -v v="$AMBIENT_FALLBACK_C" 'BEGIN{exit !(v<25)}'; then
+    ADAPTIVE_NOTES+=("warning: AMBIENT_FALLBACK_C=$AMBIENT_FALLBACK_C is the ambient assumed when the weather is unknown — a cool value here is not a safe fallback")
+  fi
+  if [[ -n "$NORMAL_WATTS_FROM_CONFIG" && -n "$TIERS_FROM_CONFIG" ]]; then
+    ADAPTIVE_NOTES+=("warning: ADAPTIVE=yes with both NORMAL_WATTS and TIERS set — the engine has nothing to fill in and will only advise")
+  fi
+  if [[ -n "$AMBIENT_C" && ( -n "$LOCATION" || -n "$LATITUDE" ) ]]; then
+    ADAPTIVE_NOTES+=("warning: AMBIENT_C is set together with LOCATION/LATITUDE/LONGITUDE — the location keys are ignored and no network will be used")
+  fi
+
+  command -v curl >/dev/null 2>&1 && HAVE_CURL=1
+  command -v wget >/dev/null 2>&1 && HAVE_WGET=1
+  command -v timeout >/dev/null 2>&1 && HAVE_TIMEOUT=1
+  if (( ! HAVE_CURL && ! HAVE_WGET )) && [[ -z "$AMBIENT_C" ]]; then
+    ADAPTIVE_NOTES+=("note: neither curl nor wget is installed — no weather can be fetched, so the budget stays at the AMBIENT_FALLBACK_C=${AMBIENT_FALLBACK_C}C value")
+  fi
+fi
+
+# Cross-key checks that need a resolved CRIT_C or Tjmax. The DIE_TARGET_C pair
+# also runs with ADAPTIVE=no when the key was typed by hand, because a target at
+# or above the emergency threshold is wrong whether or not it is in use today.
+if (( ADAPTIVE_ON )) || [[ -n "$DIE_TARGET_FROM_CONFIG" ]]; then
+  (( DIE_TARGET_C < CRIT_C )) \
+    || die "DIE_TARGET_C ($DIE_TARGET_C) must be below CRIT_C ($CRIT_C) — the target is where the budget settles, CRIT_C is the emergency"
+  (( DIE_TARGET_C < TJMAX )) \
+    || die "DIE_TARGET_C ($DIE_TARGET_C) is at or above Tjmax (${TJMAX}C) — the hardware acts first"
+fi
+if (( ADAPTIVE_ON )); then
+  (( RUNG1_T < RUNGTOP_T )) \
+    || die "the ladder collapses: the first rung would be at ${RUNG1_T}C and the top rung at ${RUNGTOP_T}C — reduce LADDER_START_MARGIN_C or LADDER_TOP_MARGIN_C, or raise CRIT_C"
+  # The working budget settles the die AT the target by construction, so a
+  # target at or above the emergency rung is not an emergency threshold at all:
+  # it is the normal operating point, and the top rung would fire on every
+  # sustained load, clamp, release, and fire again — the measured balcony
+  # failure, built in. A config reaches this by raising LADDER_TOP_MARGIN_C
+  # (which the docs offer as the way to buy overshoot margin) past
+  # DIE_TARGET_MARGIN_C, or by setting DIE_TARGET_C close to CRIT_C.
+  #
+  # Refusing to start is the wrong answer — this tool exists for machines that
+  # die uncapped, and a daemon that will not start caps nothing. So take the
+  # extra margin out of the BUDGET instead, which is the direction the user was
+  # asking for anyway, and say so in words that name both keys.
+  if (( DIE_TARGET_C >= RUNGTOP_T )); then
+    ADAPTIVE_NOTES+=("warning: the die target (${DIE_TARGET_C}C) was at or above the emergency rung (${RUNGTOP_T}C = CRIT_C $CRIT_C - LADDER_TOP_MARGIN_C $LADDER_TOP_MARGIN_C), which would have put the emergency rung under permanent load — the target is lowered to $(( RUNGTOP_T - 1 ))C and the budget with it. Keep LADDER_TOP_MARGIN_C below DIE_TARGET_MARGIN_C ($DIE_TARGET_MARGIN_C) to choose this trade yourself")
+    DIE_TARGET_C=$(( RUNGTOP_T - 1 ))
+    RUNG1_T=$(( DIE_TARGET_C - LADDER_START_MARGIN_C ))
+  fi
+  # --simulate is handed an ambient on the command line, so it is exempt: this
+  # check is about the guard loop having somewhere to get one.
+  case "${1:-}" in
+    --simulate|--selftest-parse) ;;
+    *) [[ -n "$AMBIENT_C$LOCATION$LATITUDE" ]] \
+         || die "ADAPTIVE=yes but there is nowhere to get an ambient temperature: LOCATION, LATITUDE/LONGITUDE and AMBIENT_C are all empty. Set LOCATION=auto, or coordinates, or AMBIENT_C for a fixed value." ;;
+  esac
+fi
 
 # Distinguish "the hardware cannot do this" from "we lack permission". They need
 # completely different fixes, and conflating them sends people hunting for a
@@ -291,12 +647,33 @@ apply_watts() {   # $1 = watts (decimals ok)
 }
 
 # Restore stock power, or fall back to NORMAL_WATTS if we never saved stock.
+# Deliberately the SNAPSHOT and not the rating: this is "put back what was here",
+# which is a different question from "what is this CPU rated at". Raising a limit
+# on the way out that we never lowered would be overreach.
 restore_stock_power() {
   (( CAN_CAP )) || return 1
   if [[ -r "$stock_power_file" ]]; then
     set_uw "$(<"$stock_power_file")" && return 0
   fi
   [[ -n "$NORMAL_WATTS" ]] && apply_watts "$NORMAL_WATTS"
+}
+
+# The engine's uncapped baseline. In an engine-owned ladder, tier 0 means "no cap
+# from us", and the honest expression of that is the CPU's rating — not whatever
+# happened to be in the register when this daemon first ran. The two differ
+# exactly when an earlier run left the package capped, and there the snapshot
+# turns tier 0 into a silent cap: the ladder logs "stock" and applies the old
+# limit, so the burst headroom the ladder exists to buy is simply absent.
+#
+# Scoped to ADAPTIVE=yes on purpose. That is an explicit opt-in to letting the
+# engine own the budget, so widening the baseline to the rating is inside what
+# was asked for. A legacy config is left exactly as it was.
+apply_uncapped_baseline() {
+  (( CAN_CAP )) || return 1
+  if (( ADAPTIVE_ON )) && [[ -n "$STOCK_RATING_UW" ]]; then
+    set_uw "$STOCK_RATING_UW" && return 0
+  fi
+  restore_stock_power
 }
 
 set_perf_pct() { (( HAVE_PSTATE )) || return 1; printf '%s\n' "$1" > "$PSTATE/max_perf_pct" 2>/dev/null; }
@@ -311,7 +688,9 @@ apply_tier() {     # $1 = tier index, $2 = current temp
   local i=$1 t=$2 desc perf
   if (( i == 0 )); then
     if [[ -n "$NORMAL_WATTS" ]]; then apply_watts "$NORMAL_WATTS"; desc="${NORMAL_WATTS}W"
-    else restore_stock_power; desc="stock"; fi
+    elif (( ADAPTIVE_ON )) && [[ -n "$STOCK_RATING_UW" ]]; then
+      apply_uncapped_baseline; desc="stock ${STOCK_W}W (rating)"
+    else apply_uncapped_baseline; desc="stock"; fi
     perf=100
   else
     apply_watts "${TIER_W[i-1]}"
@@ -334,11 +713,890 @@ rotate_trace() {
   return 0
 }
 
+# --- adaptive engine: weather, ambient, plan -------------------------------
+# Only ever entered with ADAPTIVE=yes. Two rules shape all of it:
+#
+#   the 2-second guard loop must NEVER block on the network — so every byte off
+#   the wire is fetched by a detached child with its own timeout and read back
+#   from a cache file, and the loop only ever looks at the cache;
+#
+#   and it must fail SAFE — unknown, stale or implausible weather lands on the
+#   hot fallback ambient and a constant cap, never on a generous budget.
+
+weather_file="$STATE_DIR/weather"
+location_file="$STATE_DIR/location"
+
+fetch_pid=0; fetch_deadline=0; next_fetch=0; fetch_fails=0; BACKOFF=120
+wx_report=init                       # ok | retrying — so a dead network logs once
+WX_TEMP=""; WX_AT=0; WX_STATUS=none; CACHE_RELOADED=0
+LOC_LAT=""; LOC_LON=""; LOC_PLACE=""; LOC_SRC=none; LOC_AT=0
+
+# Both cache files are read a line at a time and NEVER sourced. They hold bytes
+# that came off the network, and a shell that sources them is a shell that runs
+# them.
+cache_get() {      # $1 = file, $2 = key
+  local line
+  [[ -r "$1" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$2="* ]] && { printf '%s\n' "${line#*=}"; return 0; }
+  done < "$1"
+  return 1
+}
+
+# Shape first (bash, no fork), then range (awk, because these are decimals).
+# Nothing that came off the network reaches arithmetic without passing both.
+wx_temp_ok() {
+  [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]{1,3})?$ ]] || return 1
+  awk -v v="$1" 'BEGIN{exit !(v>=-90 && v<=60)}'
+}
+lat_ok() { [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]{1,6})?$ ]] && num_in "$1" -90 90; }
+lon_ok() { [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]{1,6})?$ ]] && num_in "$1" -180 180; }
+
+# ~11 km, applied to every coordinate including the ones the user typed:
+# Open-Meteo snaps to a ~7 km grid anyway, so the extra digits buy no accuracy
+# and leak a home address.
+round1() { awk -v v="$1" 'BEGIN{printf "%.1f", v}'; }
+
+reload_weather_cache() {
+  local v at
+  WX_TEMP=""; WX_AT=0; WX_STATUS=none; CACHE_RELOADED=1
+  if v=$(cache_get "$weather_file" status); then
+    [[ "$v" =~ ^[a-z0-9-]{1,24}$ ]] && WX_STATUS=$v
+  fi
+  v=$(cache_get "$weather_file" temp_c)     || return 0
+  wx_temp_ok "$v"                           || return 0
+  at=$(cache_get "$weather_file" fetched_at) || return 0
+  [[ "$at" =~ ^[0-9]{1,12}$ ]]              || return 0
+  WX_TEMP=$v; WX_AT=$at
+  return 0
+}
+
+resolve_location() {
+  local v lat lon re="^[A-Za-z0-9 ,.'-]{1,64}$"
+  LOC_LAT=""; LOC_LON=""; LOC_PLACE=""; LOC_SRC=none; LOC_AT=0
+  if [[ -n "$LATITUDE" && -n "$LONGITUDE" ]]; then
+    LOC_LAT=$(round1 "$LATITUDE"); LOC_LON=$(round1 "$LONGITUDE"); LOC_SRC=config
+    return 0
+  fi
+  if [[ -n "$LOCATION" && "$LOCATION" != auto ]]; then
+    lat=${LOCATION%%,*}; lon=${LOCATION#*,}; lon=${lon# }
+    LOC_LAT=$(round1 "$lat"); LOC_LON=$(round1 "$lon"); LOC_SRC=config
+    return 0
+  fi
+  [[ "$LOCATION" == auto ]] || return 0
+  LOC_SRC=auto
+  # The coordinate cache never expires on its own: a laptop's home does not move
+  # hourly, and a stale coordinate is harmless because it is the AMBIENT that
+  # goes stale. Reset it by deleting the file.
+  v=$(cache_get "$location_file" lat)      && lat_ok "$v" && LOC_LAT=$v
+  v=$(cache_get "$location_file" lon)      && lon_ok "$v" && LOC_LON=$v
+  v=$(cache_get "$location_file" place)    && [[ "$v" =~ $re ]] && LOC_PLACE=$v
+  v=$(cache_get "$location_file" resolved) && [[ "$v" =~ ^[0-9]{1,12}$ ]] && LOC_AT=$v
+  return 0
+}
+
+weather_url() {
+  local u=${WEATHER_URL:-$WEATHER_URL_DEFAULT}
+  u=${u//\{lat\}/$LOC_LAT}; u=${u//\{lon\}/$LOC_LON}
+  printf '%s\n' "$u"
+}
+
+# The parser is the security boundary. The daemon runs as root and these bytes
+# came from the internet, so they are never eval'd, sourced, word-split or
+# handed to a command: awk reads them on stdin and prints at most one number,
+# and that number is re-validated in bash before it means anything.
+#
+# Anchoring on the "current" object is not optional. A real Open-Meteo body
+# contains temperature_2m TWICE, and the first hit is the string "°C" inside
+# "current_units". Requiring a trailing , or } is what rejects "1e9", which
+# would otherwise truncate to a perfectly plausible 1. The 64 KiB cap keeps a
+# hostile multi-megabyte body from turning string concatenation into a hang.
+weather_extract_temp() {
+  head -c 65536 | LC_ALL=C awk '
+    { body = body $0 "\n" }
+    END {
+      if (!match(body, /"current"[ \t]*:[ \t]*\{/)) exit 1
+      s = substr(body, RSTART, 512)
+      if (!match(s, /"temperature_2m"[ \t]*:[ \t]*-?[0-9]+(\.[0-9]+)?[ \t]*[,}]/)) exit 1
+      v = substr(s, RSTART, RLENGTH)
+      sub(/^"temperature_2m"[ \t]*:[ \t]*/, "", v)
+      sub(/[ \t]*[,}]$/, "", v)
+      print v
+    }'
+}
+
+# Same shape, same reasons. GeoJS quotes its numbers and ipwho.is does not, so
+# the quote is optional and either provider works.
+json_number() {    # $1 = file, $2 = key
+  head -c 65536 -- "$1" 2>/dev/null | LC_ALL=C awk -v k="$2" '
+    { body = body $0 "\n" }
+    END {
+      if (!match(body, "\"" k "\"[ \t]*:[ \t]*\"?-?[0-9]+(\\.[0-9]+)?\"?")) exit 1
+      v = substr(body, RSTART, RLENGTH)
+      sub(/^"[^"]*"[ \t]*:[ \t]*"?/, "", v)
+      sub(/"$/, "", v)
+      print v
+    }'
+}
+
+json_place() {     # $1 = file — cosmetic only, so --detect can say WHERE it thinks it is
+  head -c 65536 -- "$1" 2>/dev/null | LC_ALL=C awk '
+    { body = body $0 "\n" }
+    END {
+      c = ""; n = ""
+      if (match(body, /"city"[ \t]*:[ \t]*"[^"]*"/)) {
+        c = substr(body, RSTART, RLENGTH); sub(/^[^:]*:[ \t]*"/, "", c); sub(/"$/, "", c)
+      }
+      if (match(body, /"country"[ \t]*:[ \t]*"[^"]*"/)) {
+        n = substr(body, RSTART, RLENGTH); sub(/^[^:]*:[ \t]*"/, "", n); sub(/"$/, "", n)
+      }
+      if (c != "" && n != "") print c ", " n
+      else if (c != "")       print c
+      else                    print n
+    }'
+}
+
+http_get() {       # $1 = url, $2 = output file. Prints a status word and returns 1 on failure.
+  local url=$1 out=$2 code rc sz
+  if (( HAVE_CURL )); then
+    # No -L: a redirect here means a captive portal, not weather. -f so an error
+    # page never reaches the parser. --proto '=https' so a rewritten URL cannot
+    # downgrade the channel that decides a power budget.
+    code=$(curl --disable -sS -f --proto '=https' --tlsv1.2 \
+             --connect-timeout 5 --max-time "$WEATHER_TIMEOUT_SEC" \
+             --max-filesize 65536 --no-keepalive \
+             -A "thermal-guard/$VERSION (+https://github.com/anatoli-iliev/thermal-guard)" \
+             -o "$out" -w '%{http_code}' -- "$url" 2>/dev/null)
+    rc=$?
+    if (( rc != 0 )); then
+      if [[ "$code" =~ ^[1-9][0-9][0-9]$ ]] && (( code >= 400 )); then
+        printf 'http-%s\n' "$code"
+      else
+        printf 'curl-%s\n' "$rc"
+      fi
+      return 1
+    fi
+  elif (( HAVE_WGET )); then
+    # wget's exit status is deliberately ignored: head closing the pipe at
+    # 64 KiB is the expected outcome on a large body and looks like a failure.
+    #
+    # -T is a DNS/connect/read timeout, not a total one: a captive portal that
+    # dribbles a byte every few seconds resets the read timer for ever, so wget
+    # alone has no upper bound on its runtime the way curl's --max-time does.
+    # coreutils' timeout supplies one. Without it we still run, we just lose it.
+    if (( HAVE_TIMEOUT )); then
+      timeout -k 2 "$WEATHER_TIMEOUT_SEC" \
+        wget -q -T "$WEATHER_TIMEOUT_SEC" -O - -- "$url" 2>/dev/null | head -c 65536 > "$out"
+    else
+      wget -q -T "$WEATHER_TIMEOUT_SEC" -O - -- "$url" 2>/dev/null | head -c 65536 > "$out"
+    fi
+  else
+    printf 'no-fetcher\n'; return 1
+  fi
+  # curl enforces --max-filesize mid-transfer only when the server sent a
+  # Content-Length, and Open-Meteo sends none, so the size is checked here too.
+  sz=$(stat -c %s "$out" 2>/dev/null || printf 0)
+  [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
+  if (( sz == 0 ));     then (( HAVE_CURL )) && printf 'unparseable\n' || printf 'wget-fail\n'; return 1; fi
+  if (( sz > 65536 ));  then printf 'too-large\n'; return 1; fi
+  return 0
+}
+
+write_weather_cache() {   # $1 = status word, $2 = temperature ("" = keep the previous)
+  local tmp="$STATE_DIR/.tg-fetch.$BASHPID.wx" t=$2 at prev
+  printf -v at '%(%s)T' -1
+  if [[ -z "$t" ]]; then
+    # A failed attempt must not erase the last good reading: staleness expires it
+    # on schedule, and meanwhile --detect can still say WHY fetching is failing.
+    prev=$(cache_get "$weather_file" temp_c) && wx_temp_ok "$prev" && t=$prev
+    if [[ -n "$t" ]]; then
+      prev=$(cache_get "$weather_file" fetched_at) \
+        && [[ "$prev" =~ ^[0-9]{1,12}$ ]] && at=$prev
+    fi
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  # Mode 0644: a temperature is not private, and this lets --detect work
+  # unprivileged. Written temp-then-mv in the same directory so the guard loop
+  # can never read a half-written file. No fsync — losing the last weather
+  # sample to a power cut is harmless, unlike losing the trace.
+  printf 'temp_c=%s\nfetched_at=%s\nstatus=%s\n' "$t" "$at" "$1" > "$tmp" 2>/dev/null || return 0
+  chmod 0644 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$weather_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+write_location_cache() {  # $1 = place name, cosmetic
+  local tmp="$STATE_DIR/.tg-fetch.$BASHPID.loc" at p=$1
+  printf -v at '%(%s)T' -1
+  p=${p//[^A-Za-z0-9 ,.-]/}; p=${p:0:64}
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  # Mode 0600: coordinates are effectively a home address.
+  printf 'lat=%s\nlon=%s\nplace=%s\nsource=geoip\nresolved=%s\n' \
+    "$LOC_LAT" "$LOC_LON" "$p" "$at" > "$tmp" 2>/dev/null || return 0
+  chmod 0600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$location_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# The only place in this program that talks to the network. It runs detached,
+# writes a cache file and nothing else, and is killed at a deadline.
+fetch_child() {
+  # THE most dangerous interaction between this feature and the rest of the
+  # daemon. systemd's default KillMode=control-group SIGTERMs every process in
+  # the cgroup, so without dropping the inherited trap first, a `systemctl stop`
+  # landing mid-fetch would run restore_and_exit INSIDE this child: a second
+  # process rewriting the RAPL register and logging "stopping" on our behalf.
+  trap - TERM INT
+  trap 'exit 143' TERM
+
+  local tmp="$STATE_DIR/.tg-fetch.$BASHPID" st url v lat lon
+
+  if (( ! HAVE_CURL && ! HAVE_WGET )); then write_weather_cache no-fetcher ""; return 0; fi
+
+  # Re-read the coordinate cache from disk. A fetch child is a subshell, so the
+  # coordinates IT resolves die with it and never reach the parent — without
+  # this line every hourly fetch asked the geocoder again, and a geocoder that
+  # was down (or rate-limiting us for asking 24 times a day) stopped the weather
+  # fetch entirely for the life of the process. Pure bash, no fork.
+  [[ -z "$LOC_LAT" || -z "$LOC_LON" ]] && resolve_location
+
+  if [[ -z "$LOC_LAT" || -z "$LOC_LON" ]]; then
+    if ! st=$(http_get "${GEOIP_URL:-$GEOIP_URL_DEFAULT}" "$tmp.geo"); then
+      write_weather_cache "$st" ""; rm -f "$tmp".* 2>/dev/null; return 0
+    fi
+    lat=$(json_number "$tmp.geo" latitude)  || lat=""
+    lon=$(json_number "$tmp.geo" longitude) || lon=""
+    if ! lat_ok "${lat:-x}" || ! lon_ok "${lon:-x}"; then
+      write_weather_cache unparseable ""; rm -f "$tmp".* 2>/dev/null; return 0
+    fi
+    LOC_LAT=$(round1 "$lat"); LOC_LON=$(round1 "$lon")
+    write_location_cache "$(json_place "$tmp.geo")"
+  fi
+
+  url=$(weather_url)
+  if ! st=$(http_get "$url" "$tmp.body"); then
+    write_weather_cache "$st" ""; rm -f "$tmp".* 2>/dev/null; return 0
+  fi
+  v=$(weather_extract_temp < "$tmp.body") || v=""
+  rm -f "$tmp".* 2>/dev/null
+  if   [[ -z "$v" ]];      then write_weather_cache unparseable ""
+  elif ! wx_temp_ok "$v";  then write_weather_cache implausible ""
+  else                          write_weather_cache ok "$v"
+  fi
+  return 0
+}
+
+# NOT `kill -0`: as root that succeeds for any live process, so after PID
+# wraparound we would either wait forever for a fetch that had already finished
+# or SIGKILL something else entirely when the deadline came round.
+is_my_child() {
+  local st ppid
+  [[ -r "/proc/$1/stat" ]] || return 1
+  st=$(<"/proc/$1/stat") || return 1
+  # Field 2 (comm) can contain spaces and parentheses, so parse from the LAST ')'.
+  st=${st##*')'}; st=${st# }
+  ppid=${st#* }; ppid=${ppid%% *}
+  [[ "$ppid" == "$$" ]]
+}
+
+# Kill the fetch child AND whatever it forked. Killing the subshell alone left
+# its curl/wget running, reparented to init — bounded by --max-time with curl,
+# completely unbounded with wget. The child is its own process group leader (see
+# the `set -m` in weather_tick), so one group kill takes the whole transfer with
+# it; the plain kill is the fallback for a group that has already gone.
+kill_fetch_child() {
+  (( fetch_pid > 1 )) || { fetch_pid=0; return 0; }
+  kill -KILL -- "-$fetch_pid" 2>/dev/null || kill -KILL "$fetch_pid" 2>/dev/null
+  wait "$fetch_pid" 2>/dev/null
+  rm -f "$STATE_DIR"/.tg-fetch.* 2>/dev/null
+  fetch_pid=0
+  return 0
+}
+
+backoff_sec() {
+  local n=$fetch_fails
+  (( n > 5 )) && n=5
+  BACKOFF=$(( 120 << n ))
+  (( BACKOFF > WEATHER_INTERVAL_SEC )) && BACKOFF=$WEATHER_INTERVAL_SEC
+  return 0
+}
+
+report_fetch_state() {    # $1 = ok | retrying, $2 = detail
+  [[ "$1" == "$wx_report" ]] && return 0
+  wx_report=$1
+  if [[ "$1" == ok ]]; then
+    log "weather fetch recovered"
+  else
+    log "warning: no weather after $fetch_fails attempts ($2) — falling back to AMBIENT_FALLBACK_C=${AMBIENT_FALLBACK_C}C once the last reading goes stale"
+  fi
+  return 0
+}
+
+schedule_first_fetch() {
+  local now earliest
+  printf -v now '%(%s)T' -1
+  # Jitter, so a crash-looping daemon (Restart=always, RestartSec=5) cannot storm
+  # a free public API and so several installs do not all fire on the hour.
+  next_fetch=$(( now + 15 + RANDOM % 300 ))
+  if (( WX_AT > 0 )); then
+    earliest=$(( WX_AT + WEATHER_INTERVAL_SEC ))
+    (( earliest > next_fetch )) && next_fetch=$earliest
+  fi
+  return 0
+}
+
+# Called once per loop iteration. At most one fetch is ever in flight: a fetch
+# that comes due while one is running is skipped, not queued, which bounds the
+# process count at 1 and the zombie lifetime at ~20s however long we run.
+# Idle, this costs two integer comparisons and no fork.
+weather_tick() {
+  local now
+  printf -v now '%(%s)T' -1
+  if (( fetch_pid )); then
+    if is_my_child "$fetch_pid"; then
+      (( now >= fetch_deadline )) || return 0
+      kill_fetch_child
+      (( fetch_fails++ ))
+      backoff_sec; next_fetch=$(( now + BACKOFF ))
+      report_fetch_state retrying "timed out"
+      return 0
+    fi
+    # rc 127 here only means bash has already reaped it, which is not a failure.
+    # The verdict is the cache file's CONTENTS, never the child's exit status.
+    wait "$fetch_pid" 2>/dev/null
+    fetch_pid=0
+    reload_weather_cache
+    # Pick up coordinates the child just resolved and wrote, so the parent stops
+    # believing it still has none — and say once, out loud, where the machine
+    # thinks it is, because a VPN putting you in another country is not
+    # something the daemon can detect, only something it can show you.
+    if [[ "$LOCATION" == auto && -z "$LOC_LAT" ]]; then
+      resolve_location
+      [[ -n "$LOC_LAT" ]] && log "location resolved from this machine's IP: $LOC_LAT,$LOC_LON${LOC_PLACE:+ ($LOC_PLACE)}, rounded to ~11km — set LATITUDE/LONGITUDE if you use a VPN"
+    fi
+    if [[ "$WX_STATUS" == ok ]]; then
+      fetch_fails=0; next_fetch=$(( now + WEATHER_INTERVAL_SEC ))
+      report_fetch_state ok ""
+    else
+      (( fetch_fails++ ))
+      backoff_sec; next_fetch=$(( now + BACKOFF ))
+      report_fetch_state retrying "$WX_STATUS"
+    fi
+    return 0
+  fi
+  # A clock stepped backwards can park the next fetch days into the future.
+  (( next_fetch - now > WEATHER_INTERVAL_SEC )) && next_fetch=$(( now + WEATHER_INTERVAL_SEC ))
+  (( now >= next_fetch )) || return 0
+  # Job control for exactly one fork, so the child is its own process group
+  # leader and kill_fetch_child can take its curl/wget with it. Switched off
+  # again immediately: the daemon has no terminal and wants none of the rest of
+  # it. Non-interactive bash prints no job notices, so this stays silent.
+  set -m
+  fetch_child </dev/null >/dev/null 2>&1 &
+  fetch_pid=$!
+  set +m
+  # The child can make TWO requests — geocode, then weather — each bounded
+  # separately by WEATHER_TIMEOUT_SEC. A deadline sized for one of them SIGKILLs
+  # a slow-but-entirely-compliant fetch and then reports a timeout that never
+  # happened, on exactly the congested link where the fetch matters most.
+  fetch_deadline=$(( now + 2 * WEATHER_TIMEOUT_SEC + 15 ))
+  return 0
+}
+
+# --- ambient and plan ------------------------------------------------------
+AMBIENT_VAL=""; AMBIENT_SRC=none; AMBIENT_AGE="-"; OUTDOOR_VAL="-"
+WX_DERATE=0        # quarters of WEATHER_MAX_AGE_SEC used up by the cached reading
+AMBIENT_LAST=""; AMBIENT_SRC_LAST=""
+PLAN_MODE=static; PLAN_REASON=adaptive-disabled
+PLAN_BUDGET="-"; PLAN_BUDGET_SRC="-"; PLAN_TIERS_CSV="-"; PLAN_CLAMP="-"
+PLAN_IDLE="-"; PLAN_WINDOW="-"
+PROP_MODE="-"; PROP_REASON="-"; PROP_BUDGET="-"; PROP_BUDGET_SRC="-"
+PROP_TOPW="-"; PROP_TIERS_CSV="-"; PROP_TIERS_STR="-"; PROP_CLAMP="-"
+# Which of the four ladder-rejection conditions fired, and where the working
+# budget would settle the die. Neither appears in the RESULT line — that
+# vocabulary is closed — but they are what turns "ladder-cannot-release" into a
+# sentence the reader can act on.
+PROP_SUB="-"; PROP_SETTLE="-"
+PLAN_MODE_ACTIVE=none; PLAN_DESC=""; PLAN_SIG_ACTIVE=""; PLAN_BUDGET_ACTIVE=""
+plan_first=1; last_fresh=-1; last_result_at=0; pin_warned=0
+PLAN_MODE_ACTIVE_PREV=none
+
+ambient_from_outdoor() {   # $1 = outdoor air temperature
+  awk -v o="$1" -v p="$PLACEMENT" -v b="$INDOOR_BASE_C" -v c="$INDOOR_COUPLING" \
+      -v off="$AMBIENT_OFFSET_C" -v der="$WX_DERATE" -v fb="$AMBIENT_FALLBACK_C" 'BEGIN{
+    if (p == "outdoor") { a = o + off }
+    else {
+      # A single additive offset cannot span the seasons: a summer flat needs
+      # about -7 and a winter one about +26, and getting winter wrong is
+      # GENEROUS, which is the dangerous direction. So the room follows only a
+      # fraction of the outdoor excess, and the max(0,...) floors it at the
+      # heating setpoint — which is also what stops a spoofed -40C reading from
+      # authorising the whole stock budget.
+      e = o - b; if (e < 0) e = 0
+      a = b + c * e + off
+    }
+    # Trust decays with age. A reading two hours and fifty minutes old used to
+    # carry exactly the same weight as one fetched five seconds ago, and then
+    # fell off a cliff at three hours — so a cold-morning ladder could survive a
+    # hot afternoon at full budget, which is the measured balcony failure with a
+    # stale reading standing in for the thermometer. Instead the estimate walks
+    # towards AMBIENT_FALLBACK_C in quarters of WEATHER_MAX_AGE_SEC, so the
+    # budget decays monotonically. It only ever walks UP: a fallback cooler than
+    # the estimate must never buy back watts.
+    if (der > 0 && fb > a) a = a + (fb - a) * (der / 4)
+    printf "%.1f", a
+  }'
+}
+
+compute_ambient() {
+  local now age
+  OUTDOOR_VAL="-"; WX_DERATE=0
+  if [[ -n "$AMBIENT_C" ]]; then
+    AMBIENT_VAL=$(awk -v v="$AMBIENT_C" 'BEGIN{printf "%.1f", v}')
+    AMBIENT_SRC=manual; AMBIENT_AGE="-"; return 0
+  fi
+  printf -v now '%(%s)T' -1
+  if [[ -n "$WX_TEMP" ]] && (( WX_AT > 0 )); then
+    age=$(( now - WX_AT ))
+    # A NEGATIVE age means the clock stepped backwards. That is stale, not
+    # fresh: calling it fresh would keep one reading alive indefinitely.
+    if (( age >= 0 && age <= WEATHER_MAX_AGE_SEC )); then
+      OUTDOOR_VAL=$WX_TEMP
+      # 0..3 quarters of the trust window used up. 4 would be the horizon
+      # itself, which is the fallback branch below.
+      WX_DERATE=$(( age * 4 / WEATHER_MAX_AGE_SEC ))
+      (( WX_DERATE > 3 )) && WX_DERATE=3
+      AMBIENT_VAL=$(ambient_from_outdoor "$WX_TEMP")
+      AMBIENT_SRC=weather; AMBIENT_AGE=$age; return 0
+    fi
+  fi
+  AMBIENT_VAL=$(awk -v v="$AMBIENT_FALLBACK_C" 'BEGIN{printf "%.1f", v}')
+  AMBIENT_SRC=fallback; AMBIENT_AGE="-"
+  return 0
+}
+
+# The engine only ever fills in a plan the user left empty. One literal anywhere
+# in NORMAL_WATTS, TIERS or CLAMP_WATTS pins the whole plan: it then advises and
+# warns, and changes nothing.
+plan_pinned() {
+  [[ -n "$NORMAL_WATTS_FROM_CONFIG$TIERS_FROM_CONFIG$CLAMP_WATTS_FROM_CONFIG" ]]
+}
+
+tiers_csv_active() {
+  local i s=""
+  (( ${#TIER_T[@]} )) || { printf '%s\n' '-'; return 0; }
+  for i in "${!TIER_T[@]}"; do
+    [[ -n "$s" ]] && s+=","
+    s+="${TIER_T[i]}:${TIER_W[i]}"
+  done
+  printf '%s\n' "$s"
+}
+
+# The whole of the physics, in one awk.
+#
+# Budget: solve T_die = T_ambient + Rtheta * P for P at the target die
+# temperature, and quantise DOWNWARDS. The 0.5 W grid is also the deadband —
+# hourly weather noise cannot move the plan without moving it a full step, which
+# at the measured 202 MHz/W is about 101 MHz.
+#
+# Shape: a ladder's only benefit is the time spent below the first rung running
+# unrestricted, and that time exists only while the die at light load sits well
+# below the rung. The light-load floor rises with ambient and the rung does not,
+# so the window collapses in the heat — which is precisely the measured balcony
+# failure, where an 11 W ladder clamped to 7 W over and over and ended up slower
+# than a steady 9 W.
+plan_compute() {
+  local out b bsrc idle win mode why wtop cl rej settle
+  if (( ! ADAPTIVE_ON )); then
+    PLAN_MODE=static; PLAN_REASON=adaptive-disabled
+    PLAN_BUDGET=${NORMAL_WATTS:--}
+    if [[ -n "$NORMAL_WATTS" ]]; then PLAN_BUDGET_SRC=config; else PLAN_BUDGET_SRC="-"; fi
+    PLAN_TIERS_CSV=$(tiers_csv_active); PLAN_CLAMP=${CLAMP_WATTS:--}
+    PLAN_IDLE="-"; PLAN_WINDOW="-"
+    return 0
+  fi
+  out=$(awk -v amb="$AMBIENT_VAL" -v ambsrc="$AMBIENT_SRC" -v target="$DIE_TARGET_C" \
+            -v rth="$RTHETA" -v step="$BUDGET_STEP_W" -v bmin="$BUDGET_MIN_W" \
+            -v bmax="$BUDGET_MAX_W" -v idlerise="$LADDER_IDLE_RISE_C" \
+            -v rung1="$RUNG1_T" -v rungtop="$RUNGTOP_T" -v minwin="$LADDER_MIN_WINDOW_C" \
+            -v amode="$ADAPTIVE_MODE" -v curmode="$PLAN_MODE_ACTIVE" \
+            -v topf="$LADDER_TOP_FACTOR" -v hyst="$TIER_HYSTERESIS_CFG" 'BEGIN{
+    b = (target - amb) / rth
+    if (b < 0) b = 0
+    # The 1e-9 is required, not defensive: a value that is exactly 11.0 can be
+    # held as 10.99999999998 and would floor to 10.5.
+    b = int(b / step + 1e-9) * step
+    if      (b > bmax) { b = bmax; bsrc = "clipped-ceiling" }
+    else if (b < bmin) { b = bmin; bsrc = "clipped-floor"   }
+    else               {           bsrc = "engine"          }
+
+    idle = amb + idlerise
+    win  = rung1 - idle
+
+    if      (ambsrc == "fallback") { mode = "constant"; why = "ambient-unknown" }
+    else if (amode  == "constant") { mode = "constant"; why = "mode-forced-constant" }
+    else if (amode  == "ladder")   { mode = "ladder";   why = "mode-forced-ladder" }
+    else if (curmode == "ladder") {
+      # 2C of mode hysteresis, hardcoded rather than a knob because a mode flip
+      # is the loudest thing the engine does and 2C is one hourly step of
+      # movement: in at window >= 8C, out at window < 6C, sticky between.
+      if (win < minwin - 2) { mode = "constant"; why = "window-too-small" }
+      else                  { mode = "ladder";   why = "window-ok" }
+    } else {
+      if (win >= minwin)    { mode = "ladder";   why = "window-ok" }
+      else                  { mode = "constant"; why = "window-too-small" }
+    }
+
+    wtop = 0; rej = "-"; floored = 0
+    if (mode == "ladder") {
+      wp = topf * b
+      # The release budget. This is the fix for the measured failure: a rung
+      # whose own settling temperature sits above its release point can never
+      # let go, and stays engaged for as long as the load lasts.
+      wr = (rung1 - hyst - amb) / rth
+      wtop = (wp < wr) ? wp : wr
+      if (wtop < 0) wtop = 0
+      wtop = int(wtop / step + 1e-9) * step
+      if (wtop < bmin) { wtop = bmin; floored = 1 }
+      # Four separate ways a ladder can be unbuildable, kept separate because
+      # they need four different sentences from the user. All of them fall
+      # through to a constant cap, which is always buildable.
+      #
+      # The last one is the one a reader misses: the WORKING rung settles the
+      # die at the target by construction, so if the target is not comfortably
+      # under the emergency rung, that rung is engaged by normal load rather
+      # than by an emergency. Re-checked here as well as at startup because a
+      # BUDGET_MIN_W floor can raise the budget above what the physics asked
+      # for, which moves the settling point without moving any rung.
+      if      (amb + rth * wtop >= rung1 - hyst) rej = "release"
+      else if (rung1 >= rungtop)                 rej = "shape"
+      else if (wtop >= b)                        rej = (floored ? "floor" : "step")
+      else if (amb + rth * b   >= rungtop)       rej = "settle"
+      if (rej != "-") { mode = "constant"; why = "ladder-cannot-release"; wtop = 0 }
+    }
+    cl = b * 0.7; if (cl < 1) cl = 1
+    printf "%g %s %.1f %.1f %s %s %g %.2f %s %.1f\n", \
+      b, bsrc, idle, win, mode, why, wtop, cl, rej, amb + rth * b
+  }')
+  read -r b bsrc idle win mode why wtop cl rej settle <<<"$out"
+  PROP_SUB=$rej; PROP_SETTLE=$settle
+
+  PROP_BUDGET=$b; PROP_BUDGET_SRC=$bsrc; PROP_MODE=$mode; PROP_REASON=$why
+  PLAN_IDLE=$idle; PLAN_WINDOW=$win
+  if [[ "$mode" == ladder ]]; then
+    # %g formatting is load-bearing: it emits "80:11 85:7", not "80:11.0 85:7.0",
+    # so a generated ladder is byte-identical to a hand-written one and passes
+    # the same TIERS regex.
+    PROP_TOPW=$wtop; PROP_CLAMP=$wtop
+    PROP_TIERS_CSV="$RUNG1_T:$b,$RUNGTOP_T:$wtop"
+    PROP_TIERS_STR="$RUNG1_T:$b $RUNGTOP_T:$wtop"
+  else
+    PROP_TOPW="-"; PROP_CLAMP=$cl; PROP_TIERS_CSV="-"; PROP_TIERS_STR="-"
+  fi
+
+  if plan_pinned; then
+    PLAN_MODE=static; PLAN_REASON=pinned
+    PLAN_BUDGET=${NORMAL_WATTS:--}; PLAN_BUDGET_SRC=config
+    PLAN_TIERS_CSV=$(tiers_csv_active); PLAN_CLAMP=${CLAMP_WATTS:--}
+  else
+    PLAN_MODE=$PROP_MODE; PLAN_REASON=$PROP_REASON
+    PLAN_BUDGET=$PROP_BUDGET; PLAN_BUDGET_SRC=$PROP_BUDGET_SRC
+    PLAN_TIERS_CSV=$PROP_TIERS_CSV; PLAN_CLAMP=$PROP_CLAMP
+  fi
+  return 0
+}
+
+plan_describe() {
+  if [[ "$PROP_MODE" == ladder ]]; then printf 'ladder TIERS="%s"\n' "$PROP_TIERS_STR"
+  else printf 'constant %sW\n' "$PROP_BUDGET"; fi
+}
+
+# Re-planning while a rung is engaged can strand the engine on a rung that no
+# longer exists, so the new ladder is built into temporaries, validated by the
+# same rules the config path uses, and only then committed.
+plan_commit() {
+  local -a nt=() nw=()
+  local i rung
+  if [[ "$PROP_MODE" == ladder ]]; then
+    nt=("$RUNG1_T" "$RUNGTOP_T"); nw=("$PROP_BUDGET" "$PROP_TOPW")
+  else
+    # Engine constant mode reuses the legacy single-rung path. The rung goes at
+    # WARN_C, except that a Tjmax-derived WARN_C can sit ABOVE CRIT_C, where it
+    # could never fire; the top-rung temperature is the meaningful bound there.
+    rung=$RUNGTOP_T
+    (( WARN_C < rung )) && rung=$WARN_C
+    # A rung the hardware would beat us to is not a rung. This only bites when
+    # CRIT_C and WARN_C are both at or above Tjmax, and the alternative is
+    # rejecting the plan — i.e. running with no cap at all, which is the one
+    # outcome worse than a rung that fires late.
+    (( rung >= TJMAX )) && rung=$(( TJMAX - 1 ))
+    nt=("$rung"); nw=("$PROP_CLAMP")
+  fi
+  for i in "${!nt[@]}"; do
+    [[ "${nt[i]}" =~ ^[0-9]+$ && "${nw[i]}" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+      || { plan_reject "rung '${nt[i]}:${nw[i]}' is not temp:watts"; return 1; }
+    (( nt[i] < TJMAX )) \
+      || { plan_reject "rung ${nt[i]}C is at or above Tjmax (${TJMAX}C)"; return 1; }
+    if (( i > 0 )) && (( nt[i] <= nt[i-1] )); then
+      plan_reject "rungs ${nt[i-1]}C and ${nt[i]}C are not ascending"; return 1
+    fi
+    awk -v x="${nw[i]}" 'BEGIN{exit !(x>0)}' \
+      || { plan_reject "rung ${nt[i]}C would get ${nw[i]}W"; return 1; }
+  done
+  TIER_T=("${nt[@]}"); TIER_W=("${nw[@]}")
+  if [[ "$PROP_MODE" == ladder ]]; then
+    NORMAL_WATTS=""
+    TIER_HYSTERESIS=$TIER_HYSTERESIS_CFG
+  else
+    NORMAL_WATTS=$PROP_BUDGET
+    CLAMP_WATTS=$PROP_CLAMP
+    TIER_HYSTERESIS=$(( WARN_C - RECOVER_C ))
+    (( TIER_HYSTERESIS >= 1 )) || TIER_HYSTERESIS=1
+  fi
+  PLAN_MODE_ACTIVE=$PROP_MODE
+  return 0
+}
+
+# --simulate has to run the committer to report honestly, but simulating must not
+# write to the trace or the journal, so the rejection notice is muted there.
+PLAN_QUIET=0
+plan_reject() {
+  (( PLAN_QUIET )) && return 0
+  log "warning: adaptive engine produced an invalid ladder ($1) — falling back to a constant cap"
+  return 0
+}
+
+# "Keep the previous plan" is the right answer only when there IS one. At
+# startup there is not: a rejected first ladder used to leave ADAPTIVE=yes with
+# NORMAL_WATTS empty and no rungs, i.e. an explicit opt-in that capped nothing
+# at all — on a machine whose whole problem is that uncapped it dies. So a
+# rejected ladder falls through to constant mode, which is always buildable,
+# and the reported plan is corrected to the one that was actually committed.
+plan_commit_or_constant() {
+  plan_commit && return 0
+  [[ "$PROP_MODE" == ladder ]] || return 1
+  PROP_MODE=constant; PROP_REASON=ladder-cannot-release; PROP_SUB=invalid
+  PROP_CLAMP=$(awk -v b="$PROP_BUDGET" 'BEGIN{v=b*0.7; if(v<1)v=1; printf "%.2f", v}')
+  PROP_TOPW="-"; PROP_TIERS_CSV="-"; PROP_TIERS_STR="-"
+  if ! plan_pinned; then
+    PLAN_MODE=$PROP_MODE; PLAN_REASON=$PROP_REASON
+    PLAN_TIERS_CSV=$PROP_TIERS_CSV; PLAN_CLAMP=$PROP_CLAMP
+  fi
+  plan_commit
+}
+
+# The RESULT line is the crash-survival record: after a power cut it is the only
+# thing that says which policy was in force. It must therefore never describe a
+# plan that was rejected, so the proposal is snapshotted before it overwrites
+# the reported plan and put back if the commit fails.
+PLAN_SAVE=""
+plan_snapshot() {
+  PLAN_SAVE="$PLAN_MODE|$PLAN_REASON|$PLAN_BUDGET|$PLAN_BUDGET_SRC|$PLAN_TIERS_CSV|$PLAN_CLAMP"
+}
+plan_restore() {
+  [[ -n "$PLAN_SAVE" ]] || return 0
+  IFS='|' read -r PLAN_MODE PLAN_REASON PLAN_BUDGET PLAN_BUDGET_SRC PLAN_TIERS_CSV PLAN_CLAMP \
+    <<<"$PLAN_SAVE"
+}
+
+plan_signature() { printf '%s|%s|%s|%s' "$PROP_MODE" "$PROP_BUDGET" "$PROP_TIERS_CSV" "$PROP_CLAMP"; }
+
+adaptive_result_line() {
+  local amb="-" rth="-" rsrc="-" tgt="-" idle="-" win="-" wmin="-" age=$AMBIENT_AGE now
+  if (( ADAPTIVE_ON )); then
+    amb=$AMBIENT_VAL; rth=$RTHETA_OUT; rsrc=$RTHETA_SRC; tgt=$DIE_TARGET_C
+    idle=$PLAN_IDLE; win=$PLAN_WINDOW; wmin=$WINDOW_MIN_OUT
+  fi
+  # Recomputed rather than reused: the heartbeat restates a plan that has not
+  # changed, and a frozen age would claim the reading is as fresh as it was when
+  # the plan was made — which is exactly the number a post-mortem must not lie about.
+  if [[ "$AMBIENT_SRC" == weather ]] && (( WX_AT > 0 )); then
+    printf -v now '%(%s)T' -1; age=$(( now - WX_AT ))
+  fi
+  printf 'RESULT v=1 ambient_c=%s ambient_src=%s ambient_age_sec=%s rtheta=%s rtheta_src=%s tjmax_c=%s crit_c=%s target_c=%s idle_floor_c=%s window_c=%s window_min_c=%s mode=%s reason=%s budget_w=%s budget_src=%s tiers=%s clamp_w=%s\n' \
+    "$amb" "$AMBIENT_SRC" "$age" "$rth" "$rsrc" "$TJMAX" "$CRIT_C" "$tgt" \
+    "$idle" "$win" "$wmin" "$PLAN_MODE" "$PLAN_REASON" "$PLAN_BUDGET" \
+    "$PLAN_BUDGET_SRC" "$PLAN_TIERS_CSV" "$PLAN_CLAMP"
+}
+
+adaptive_init() {
+  (( ADAPTIVE_ON )) || return 0
+  resolve_location
+  [[ -z "$AMBIENT_C" ]] && reload_weather_cache
+  CACHE_RELOADED=0
+  compute_ambient
+  plan_compute
+  return 0
+}
+
+# Setting AMBIENT_C suppresses all network use, so the whole fetch machinery is
+# gated on one flag rather than on a condition repeated at every call site:
+# the daemon touches the network IF AND ONLY IF ADAPTIVE=yes and AMBIENT_C is empty.
+WEATHER_ON=0
+(( ADAPTIVE_ON )) && [[ -z "$AMBIENT_C" ]] && WEATHER_ON=1
+
+log_ambient_change() {
+  local moved=0 detail
+  if   [[ "$AMBIENT_SRC" != "$AMBIENT_SRC_LAST" ]]; then moved=1
+  elif [[ -z "$AMBIENT_LAST" ]];                    then moved=1
+  else
+    awk -v a="$AMBIENT_VAL" -v b="$AMBIENT_LAST" \
+      'BEGIN{d=a-b; if(d<0)d=-d; exit !(d>=0.5)}' && moved=1
+  fi
+  (( moved )) || return 0
+  AMBIENT_LAST=$AMBIENT_VAL; AMBIENT_SRC_LAST=$AMBIENT_SRC
+  if [[ "$AMBIENT_SRC" == weather ]]; then
+    detail="outdoor ${OUTDOOR_VAL}C, age ${AMBIENT_AGE}s, weather"
+  else
+    detail=$AMBIENT_SRC
+  fi
+  log "AMBIENT ${AMBIENT_VAL}C $PLACEMENT ($detail)"
+}
+
+log_plan_change() {   # $1 = the plan that was active before
+  local pfx="PLAN" was="" drop=0
+  [[ -n "$1" ]] && was=" (was $1)"
+  if [[ -n "$PLAN_BUDGET_ACTIVE" ]]; then
+    awk -v a="$PROP_BUDGET" -v b="$PLAN_BUDGET_ACTIVE" 'BEGIN{exit !(a<b)}' && drop=1
+  fi
+  # A mode change, or anything that takes performance away, is loud on purpose:
+  # these are the lines someone reads when the machine feels slow.
+  if [[ "$PROP_MODE" != "$PLAN_MODE_ACTIVE_PREV" ]] || (( drop )); then pfx="warning: PLAN"; fi
+  log "$pfx $PLAN_DESC$was — window ${PLAN_WINDOW}C vs ${WINDOW_MIN_OUT}C at ${AMBIENT_VAL}C ambient ($PROP_REASON)"
+}
+
+# The largest power figure the user pinned, and the words for naming it.
+# Warning only about NORMAL_WATTS left the commonest dangerous pin of the three
+# — a TIERS ladder carried somewhere hotter than it was measured, which is
+# exactly what examples/asus-s550ca-tiered.conf is — with nothing said about it
+# at all. Prints "<watts>|<phrase>", or nothing if no power figure is pinned.
+pin_max_watts() {
+  local best="" phrase="" pair t w
+  if [[ -n "$NORMAL_WATTS_FROM_CONFIG" ]]; then
+    best=$NORMAL_WATTS_FROM_CONFIG
+    phrase="NORMAL_WATTS=$best is pinned and is"
+  fi
+  for pair in $TIERS_FROM_CONFIG; do
+    [[ "$pair" == *:* ]] || continue
+    t=${pair%%:*}; w=${pair#*:}
+    if [[ -z "$best" ]] || awk -v a="$w" -v b="$best" 'BEGIN{exit !(a>b)}'; then
+      best=$w; phrase="the ${t}C rung of your pinned TIERS carries ${w}W, which is"
+    fi
+  done
+  if [[ -n "$CLAMP_WATTS_FROM_CONFIG" ]] \
+     && { [[ -z "$best" ]] || awk -v a="$CLAMP_WATTS_FROM_CONFIG" -v b="$best" 'BEGIN{exit !(a>b)}'; }; then
+    best=$CLAMP_WATTS_FROM_CONFIG
+    phrase="CLAMP_WATTS=$best is pinned and is"
+  fi
+  [[ -n "$best" ]] || return 1
+  printf '%s|%s\n' "$best" "$phrase"
+}
+
+# True (0) when the pinned plan asks for more watts than this ambient supports.
+# Sets PIN_PHRASE to the sentence fragment that names whichever key holds it.
+PIN_PHRASE=""
+pin_over_budget() {
+  local v
+  PIN_PHRASE=""
+  v=$(pin_max_watts) || return 1
+  PIN_PHRASE=${v#*|}; v=${v%%|*}
+  awk -v a="$v" -v b="$PROP_BUDGET" 'BEGIN{exit !(a>b)}'
+}
+
+warn_pin_over_budget() {
+  if ! pin_over_budget; then pin_warned=0; return 0; fi
+  (( pin_warned )) && return 0
+  pin_warned=1
+  log "warning: $PIN_PHRASE above the ${PROP_BUDGET}W this ambient (${AMBIENT_VAL}C) supports — your number wins; the ladder is what will save you"
+}
+
+# Re-derive the rung from the temperature we actually have. Carrying the old
+# index over is what strands the engine on a rung that no longer exists.
+plan_apply_now() {   # $1 = current die temperature
+  local i t=$1 n=${#TIER_T[@]} newtier=0
+  for (( i = 0; i < n; i++ )); do (( t >= TIER_T[i] )) && newtier=$(( i + 1 )); done
+  cur_tier=$newtier
+  esc_run=0
+  apply_tier "$cur_tier" "$t"
+}
+
+# Recompute only when something actually changed, so the steady state adds zero
+# forks per iteration: a fetch was just reaped, the freshness verdict flipped,
+# or this is the first pass.
+plan_tick() {        # $1 = current die temperature
+  local now fresh age sig prev
+  printf -v now '%(%s)T' -1
+  # Freshness is judged against the wall clock every iteration, which is also
+  # what makes a resume from suspend safe with no extra machinery: the first
+  # iteration back sees the cached reading age past the horizon, drops to the
+  # conservative budget here, and weather_tick (which ran just before) has
+  # already started the fetch that will lift it again.
+  # Not a boolean but a trust level: 0 = no usable reading, 1..4 = quarters of
+  # WEATHER_MAX_AGE_SEC used up. Each step down is a real change of ambient (see
+  # ambient_from_outdoor) and so has to trigger a re-plan, which a plain
+  # fresh/stale flag would not. Integer arithmetic, still no fork per iteration.
+  fresh=0
+  if [[ -z "$AMBIENT_C" && -n "$WX_TEMP" ]] && (( WX_AT > 0 )); then
+    age=$(( now - WX_AT ))
+    if (( age >= 0 && age <= WEATHER_MAX_AGE_SEC )); then
+      fresh=$(( 1 + age * 4 / WEATHER_MAX_AGE_SEC ))
+      (( fresh > 4 )) && fresh=4
+    fi
+  fi
+  if (( CACHE_RELOADED || plan_first || fresh != last_fresh )); then
+    CACHE_RELOADED=0; last_fresh=$fresh; plan_first=0
+    plan_snapshot
+    compute_ambient
+    log_ambient_change
+    plan_compute
+    if plan_pinned; then
+      warn_pin_over_budget
+    else
+      sig=$(plan_signature)
+      if [[ "$sig" != "$PLAN_SIG_ACTIVE" ]]; then
+        prev=$PLAN_DESC
+        PLAN_MODE_ACTIVE_PREV=$PLAN_MODE_ACTIVE
+        if plan_commit_or_constant; then
+          # Keyed on the PROPOSAL, not on what was committed: if a ladder had to
+          # fall through to a constant cap, an identical proposal next hour must
+          # not retry it and log the same fallback all over again.
+          PLAN_SIG_ACTIVE=$sig; PLAN_DESC=$(plan_describe)
+          PLAN_BUDGET_ACTIVE=$PROP_BUDGET
+          log_plan_change "$prev"
+          plan_apply_now "$1"
+          log "$(adaptive_result_line)"
+          last_result_at=$now
+        else
+          # Nothing was applied, so the reported plan must go back to describing
+          # what is actually in force rather than what was refused.
+          plan_restore
+        fi
+      else
+        # Same proposal as last time, so nothing was committed — and the plan
+        # that IS in force may differ from this proposal (a ladder that had to
+        # fall through to a constant cap). Report the committed one.
+        plan_restore
+      fi
+    fi
+  fi
+  # The heartbeat is what makes a post-mortem possible: after a power cut the
+  # last RESULT line before the gap says exactly which budget and mode were in
+  # force, which the temperature column alone cannot tell you.
+  if (( ADAPTIVE_HEARTBEAT_SEC > 0 )) && (( now - last_result_at >= ADAPTIVE_HEARTBEAT_SEC )); then
+    log "$(adaptive_result_line)"
+    last_result_at=$now
+  fi
+  return 0
+}
+
 # Put the hardware back on a clean stop. Without this, `systemctl stop` leaves
 # the CPU capped with no running service to explain why — the values live in
 # hardware registers and survive the process.
 restore_and_exit() {
   trap - TERM INT
+  # Reap an in-flight fetch before touching hardware, so nothing of ours is
+  # still running when the power limit goes back to stock.
+  kill_fetch_child
   if [[ "$RESTORE_ON_EXIT" == yes ]]; then
     restore_stock_power
     set_perf_pct 100
@@ -398,17 +1656,285 @@ EOF
   Running unlimited until ${TIER_T[0]}C, then the ladder above takes over.
 EOF
   fi
+  print_adaptive
+  return 0
+}
+
+# Appended AFTER everything print_detect already emitted, in the same order, so
+# every grep someone has written against this output still matches where it did.
+print_adaptive() {
+  local f='  %-19s: %s\n' m
+  printf '\n'
+  if (( ! ADAPTIVE_ON )); then
+    printf 'adaptive\n'
+    # shellcheck disable=SC2059
+    printf "$f" status 'off (ADAPTIVE=no) — no network, no derived values, v1.1 behaviour'
+    plan_compute
+    adaptive_result_line
+    return 0
+  fi
+  adaptive_init
+  printf 'adaptive (ADAPTIVE=yes)\n'
+  # shellcheck disable=SC2059
+  {
+  if [[ "$PLACEMENT" == outdoor ]]; then
+    printf "$f" placement "$(printf 'outdoor  (ambient = outdoor reading, trim %+.1fC)' "$AMBIENT_OFFSET_C")"
+  else
+    printf "$f" placement "$(printf 'indoor  (room = %.1fC + %s x (outdoor - %.1fC), trim %+.1fC)' \
+      "$INDOOR_BASE_C" "$INDOOR_COUPLING" "$INDOOR_BASE_C" "$AMBIENT_OFFSET_C")"
+  fi
+  if [[ -n "$AMBIENT_C" ]]; then
+    printf "$f" location 'not needed — AMBIENT_C is set, so no location and no network are used'
+    printf "$f" 'weather provider' 'none — AMBIENT_C overrides it'
+  else
+    if [[ -n "$LOC_LAT" ]]; then
+      printf "$f" location "$LOC_LAT,$LOC_LON  (${LOC_SRC}${LOC_PLACE:+, $LOC_PLACE}$( (( LOC_AT > 0 )) && printf ', resolved %s' "$(date -Is -d "@$LOC_AT" 2>/dev/null)" ), rounded to ~11km)"
+    else
+      printf "$f" location "unresolved (LOCATION=$LOCATION) — will resolve from your IP on the first fetch"
+    fi
+    printf "$f" 'weather provider' "$(printf '%s  (every %ss, timeout %ss, stale after %ss)' \
+      "$(weather_host)" "$WEATHER_INTERVAL_SEC" "$WEATHER_TIMEOUT_SEC" "$WEATHER_MAX_AGE_SEC")"
+    printf "$f" 'last fetch' "$(describe_last_fetch)"
+    printf "$f" 'outdoor now' "${OUTDOOR_VAL}C"
+  fi
+  if (( WX_DERATE > 0 )); then
+    printf "$f" 'ambient in use' "${AMBIENT_VAL}C  ($AMBIENT_SRC, aged $(( WX_DERATE * 25 ))% of the way to the ${AMBIENT_FALLBACK_C}C fallback — the reading is ${AMBIENT_AGE}s old of ${WEATHER_MAX_AGE_SEC}s)"
+  else
+    printf "$f" 'ambient in use' "${AMBIENT_VAL}C  ($AMBIENT_SRC)"
+  fi
+  if [[ "$RTHETA_SRC" == config ]]; then
+    printf "$f" 'thermal resistance' "$RTHETA_OUT C/W  (RTHETA_C_PER_W in your config — measured, not assumed)"
+  else
+    printf "$f" 'thermal resistance' "$RTHETA_OUT C/W  (assumed: design $(awk -v tj="$TJMAX" -v s="$STOCK_W" 'BEGIN{printf "%.2f", (tj-40)/s}') x RTHETA_DERATE $RTHETA_DERATE — NOT measured;"
+    printf '  %-19s  run a sustained load, read die temp and package power, and set\n' ''
+    printf '  %-19s  RTHETA_C_PER_W = (die - ambient) / watts)\n' ''
+  fi
+  printf "$f" 'die target' "${DIE_TARGET_C}C  (CRIT_C $CRIT_C - DIE_TARGET_MARGIN_C $DIE_TARGET_MARGIN_C)"
+  # Printed whether or not BUDGET_MAX_W is set, because this number also decides
+  # BUDGET_MIN_W and LADDER_IDLE_RISE_C — and when it is a stale cap rather than
+  # the real rating, every one of them is quietly wrong with nothing on screen
+  # to check it against.
+  printf "$f" 'stock power limit' "${STOCK_W}W  (from $STOCK_SRC — compare this with your CPU's rated TDP)"
+  # Printed separately and only when they disagree, because the two numbers answer
+  # different questions and conflating them is the bug this line exists to expose.
+  if [[ -n "$STOCK_SAVED_W" ]] && [[ "$STOCK_SAVED_W" != "$STOCK_W" ]]; then
+    printf "$f" 'saved snapshot' "${STOCK_SAVED_W}W  (restored on exit; NOT used for budgets)"
+  fi
+  printf "$f" 'budget band' "${BUDGET_MIN_W}W .. ${BUDGET_MAX_W}W  (floor $BUDGET_MIN_SRC, ceiling $BUDGET_MAX_SRC)"
+  printf "$f" 'sustainable budget' "${PROP_BUDGET}W  ($PROP_BUDGET_SRC)"
+  printf "$f" 'light-load floor' "$(printf '%sC  (ambient + %.1fC idle rise, %s)' "$PLAN_IDLE" "$LADDER_IDLE_RISE_C" "$IDLE_RISE_SRC")"
+  printf "$f" 'burst window' "${PLAN_WINDOW}C  (first rung ${RUNG1_T}C minus floor ${PLAN_IDLE}C), needs ${WINDOW_MIN_OUT}C"
+  printf "$f" mode "${PROP_MODE^^}"
+  print_plan_reason "$f" '                       '
+  if plan_pinned; then
+    printf "$f" 'would apply' "$(plan_would_apply)   (ADVISORY ONLY — your NORMAL_WATTS/TIERS wins)"
+    if pin_over_budget; then
+      printf "$f" warning "$PIN_PHRASE above the ${PROP_BUDGET}W this ambient (${AMBIENT_VAL}C) supports — your number wins; the ladder is what will save you"
+    fi
+  else
+    printf "$f" 'would apply' "$(plan_would_apply)"
+  fi
+  if (( WEATHER_ON )); then
+    printf "$f" network "YES — outbound HTTPS to $(weather_host) every ${WEATHER_INTERVAL_SEC}s"
+  else
+    printf "$f" network 'none — AMBIENT_C is set, so nothing is fetched'
+  fi
+  if (( ${#ADAPTIVE_NOTES[@]} )); then
+    for m in "${ADAPTIVE_NOTES[@]}"; do printf "$f" note "$m"; done
+  fi
+  if [[ -z "$CRIT_C_FROM_CONFIG" ]]; then
+    printf "$f" warning "CRIT_C (${CRIT_C}C) is derived from Tjmax, not measured — the adaptive budget aims for ${DIE_TARGET_C}C. If your machine misbehaves BELOW Tjmax, read your trace and set CRIT_C first, or this budget is too generous."
+  fi
+  }
+  adaptive_result_line
+  return 0
+}
+
+weather_host() {
+  local u
+  u=$(weather_url); u=${u#https://}
+  printf '%s\n' "${u%%/*}"
+}
+
+# The status word the fetch child recorded, in words. This is what replaces a
+# --weather-test subcommand: whatever is wrong is already written down.
+describe_last_fetch() {
+  local now age
+  printf -v now '%(%s)T' -1
+  if (( WX_AT > 0 )); then age=$(( now - WX_AT )); else age=-1; fi
+  case "$WX_STATUS" in
+    ok)   printf 'ok, %ss ago\n' "$age" ;;
+    none) printf 'never — no reading has been cached yet\n' ;;
+    *)    if (( age >= 0 )); then printf 'FAILED (%s), last good reading %ss ago\n' "$WX_STATUS" "$age"
+          else printf 'FAILED (%s), no good reading yet\n' "$WX_STATUS"; fi ;;
+  esac
+}
+
+plan_would_apply() {
+  if [[ "$PROP_MODE" == ladder ]]; then
+    printf 'TIERS="%s"   baseline stock, perf %s at the top rung\n' "$PROP_TIERS_STR" "$CLAMP_PERF_PCT"
+  else
+    local rung=$RUNGTOP_T
+    (( WARN_C < rung )) && rung=$WARN_C
+    printf 'NORMAL_WATTS=%s   CLAMP_WATTS=%s at %sC   CLAMP_PERF_PCT=%s\n' \
+      "$PROP_BUDGET" "$PROP_CLAMP" "$rung" "$CLAMP_PERF_PCT"
+  fi
+}
+
+print_plan_reason() {   # $1 = label format, $2 = indent for continuation lines
+  local f=$1 c=$2
+  # shellcheck disable=SC2059
+  case "$PROP_REASON" in
+    window-ok)
+      printf "$f" why "${PLAN_WINDOW}C of headroom below the first rung is worth having, so the"
+      printf '%smachine runs unrestricted while cool and steps down at %sC.\n' "$c" "$RUNG1_T" ;;
+    window-too-small)
+      printf "$f" why "at ${AMBIENT_VAL}C ambient the die idles near ${PLAN_IDLE}C, only ${PLAN_WINDOW}C below"
+      printf '%sthe first rung at %sC — less than the %sC that makes a\n' "$c" "$RUNG1_T" "$WINDOW_MIN_OUT"
+      printf '%sladder worth its risk, so a constant %sW cap is used instead.\n' "$c" "$PROP_BUDGET" ;;
+    ambient-unknown)
+      printf "$f" why "no trusted ambient temperature, so the conservative AMBIENT_FALLBACK_C"
+      printf '%sbudget is used and no ladder is built.\n' "$c" ;;
+    ladder-cannot-release)
+      # One RESULT slug, four different things to say about it. Naming the wrong
+      # term here is worse than saying nothing: the reader cannot argue with a
+      # reason that does not mention the key that actually caused it.
+      case "$PROP_SUB" in
+        shape)
+          printf "$f" why "the first rung (${RUNG1_T}C) is not below the top rung (${RUNGTOP_T}C), so"
+          printf '%sthere is no ladder to build — a constant cap is used instead.\n' "$c" ;;
+        floor)
+          printf "$f" why "the top rung would have to be floored up to BUDGET_MIN_W (${BUDGET_MIN_W}W),"
+          printf '%swhich leaves no step below the working budget of %sW, so a constant\n' "$c" "$PROP_BUDGET"
+          printf '%scap is used instead.\n' "$c" ;;
+        step)
+          printf "$f" why "LADDER_TOP_FACTOR ($LADDER_TOP_FACTOR) leaves the top rung no lower than the"
+          printf '%sworking budget of %sW, so the ladder would have no step in it and a\n' "$c" "$PROP_BUDGET"
+          printf '%sconstant cap is used instead.\n' "$c" ;;
+        invalid)
+          printf "$f" why "the ladder's rungs are not something the tier engine can run at all"
+          printf '%s(check CRIT_C and WARN_C against Tjmax), so a constant cap is used\n' "$c"
+          printf '%sinstead — a cap that is late is still better than no cap.\n' "$c" ;;
+        settle)
+          printf "$f" why "the working budget would settle the die at ${PROP_SETTLE}C, at or above the"
+          printf '%semergency rung at %sC — that rung would then be engaged by ordinary\n' "$c" "$RUNGTOP_T"
+          printf '%sload rather than by an emergency, so a constant cap is used instead.\n' "$c" ;;
+        *)
+          printf "$f" why "the top rung would settle above its own release temperature and could"
+          printf '%snever let go, so a constant cap is used instead.\n' "$c" ;;
+      esac ;;
+    mode-forced-ladder|mode-forced-constant)
+      printf "$f" why "ADAPTIVE_MODE=$ADAPTIVE_MODE in your config." ;;
+    pinned)
+      printf "$f" why "your NORMAL_WATTS/TIERS is set, so the engine only advises." ;;
+    *)
+      printf "$f" why "$PROP_REASON" ;;
+  esac
+}
+
+# No hardware register is written, no socket is opened, and nothing here needs a
+# sensor, RAPL or any thermal history — so the physics can be argued about on a
+# machine that has none of them.
+print_simulate() {   # $1 = <outdoor C> | ambient=<c> | unknown
+  local arg=${1:-} v head=""
+  # Validated whether or not the engine is on. Nested under ADAPTIVE=yes, a typo
+  # was answered with "adaptive is off" and exit 0 — the one reply that hides
+  # both mistakes at once, so someone running against the wrong config path
+  # concludes the feature is disabled rather than that they mistyped.
+  case "$arg" in
+    unknown)
+      head="no trusted ambient  ->  assuming AMBIENT_FALLBACK_C = $(round1 "$AMBIENT_FALLBACK_C")C, constant mode forced" ;;
+    ambient=*)
+      v=${arg#ambient=}
+      { is_dec "$v" && num_in "$v" -60 70; } || {
+        printf '%s: --simulate ambient=<c> needs a temperature between -60 and 70 (got %q)\n' \
+          "$PROGNAME" "$v" >&2; return 2; } ;;
+    *)
+      { is_dec "$arg" && num_in "$arg" -90 60; } || {
+        printf '%s: --simulate takes <outdoor C>, ambient=<c> or unknown (got %q)\n' \
+          "$PROGNAME" "$arg" >&2; return 2; } ;;
+  esac
+  printf 'thermal-guard %s — simulation\n' "$VERSION"
+  printf 'nothing was written to hardware, no network was used\n\n'
+  if (( ! ADAPTIVE_ON )); then
+    printf '  adaptive is off (ADAPTIVE=no) — the engine chooses nothing, and the\n'
+    printf '  configured NORMAL_WATTS/TIERS apply exactly as they did in v1.1.\n'
+    plan_compute
+    adaptive_result_line
+    return 0
+  fi
+  case "$arg" in
+    unknown)
+      AMBIENT_VAL=$(round1 "$AMBIENT_FALLBACK_C"); AMBIENT_SRC=fallback
+      AMBIENT_AGE="-"; OUTDOOR_VAL="-"
+      printf '%s\n\n' "$head" ;;
+    ambient=*)
+      AMBIENT_VAL=$(round1 "${arg#ambient=}"); AMBIENT_SRC=simulated
+      AMBIENT_AGE="-"; OUTDOOR_VAL="-"
+      printf 'ambient at the machine %sC  (given directly: no placement transform, no AMBIENT_OFFSET_C)\n\n' \
+        "$AMBIENT_VAL" ;;
+    *)
+      OUTDOOR_VAL=$(round1 "$arg"); AMBIENT_VAL=$(ambient_from_outdoor "$arg")
+      AMBIENT_SRC=simulated; AMBIENT_AGE="-"
+      if [[ "$PLACEMENT" == outdoor ]]; then
+        printf 'outdoor %sC -> ambient at the machine %sC  (used directly, trim %+.1f)\n\n' \
+          "$OUTDOOR_VAL" "$AMBIENT_VAL" "$AMBIENT_OFFSET_C"
+      else
+        printf 'outdoor %sC -> indoor estimate %sC  (%.1f + %s x %s, trim %+.1f)\n\n' \
+          "$OUTDOOR_VAL" "$AMBIENT_VAL" "$INDOOR_BASE_C" "$INDOOR_COUPLING" \
+          "$(awk -v o="$arg" -v b="$INDOOR_BASE_C" 'BEGIN{e=o-b; if(e<0)e=0; printf "%.1f", e}')" \
+          "$AMBIENT_OFFSET_C"
+      fi ;;
+  esac
+  plan_compute
+  # Show what would be COMMITTED, not merely what was proposed. The two diverge
+  # when a rung lands where the hardware would act first, and the committer then
+  # falls through to a constant cap. Reporting the proposal there would have
+  # --simulate promise a ladder the daemon goes on to refuse — in the one command
+  # whose entire purpose is letting someone check the engine before trusting it.
+  local unbuildable=0
+  PLAN_QUIET=1; plan_commit_or_constant || unbuildable=1; PLAN_QUIET=0
+  local f='  %-24s %s\n'
+  # shellcheck disable=SC2059
+  {
+  printf "$f" 'ambient at the machine' "${AMBIENT_VAL}C"
+  printf "$f" 'thermal resistance' "$RTHETA_OUT C/W  ($RTHETA_SRC)"
+  printf "$f" 'die target' "${DIE_TARGET_C}C       (CRIT_C $CRIT_C - DIE_TARGET_MARGIN_C $DIE_TARGET_MARGIN_C)"
+  printf "$f" 'sustainable budget' "$(awk -v t="$DIE_TARGET_C" -v a="$AMBIENT_VAL" -v r="$RTHETA" 'BEGIN{printf "%.3f", (t-a)/r}')W -> ${PROP_BUDGET}W applied   (floor ${BUDGET_MIN_W}W, ceiling ${BUDGET_MAX_W}W)"
+  printf "$f" 'light-load die floor' "${PLAN_IDLE}C     (ambient + $(printf '%.1f' "$LADDER_IDLE_RISE_C")C idle rise)"
+  printf "$f" 'first rung would be' "${RUNG1_T}C       -> burst window ${PLAN_WINDOW}C, needs ${WINDOW_MIN_OUT}C"
+  if (( unbuildable )); then
+    printf "$f" decision 'NO USABLE PLAN — would not cap power'
+  elif [[ "$PROP_MODE" == ladder ]]; then
+    printf "$f" decision 'LADDER'
+  else
+    printf "$f" decision "CONSTANT CAP ${PROP_BUDGET}W"
+  fi
+  print_plan_reason "$f" '                           '
+  printf "$f" 'would apply' "$(plan_would_apply)"
+  }
+  adaptive_result_line
   return 0
 }
 
 case "${1:-}" in
   --detect|--check) print_detect; exit 0 ;;
+  --simulate) print_simulate "${2:-}"; exit $? ;;
+  # Reads a body on stdin and prints what the parser would accept, or nothing.
+  # This is how the security boundary gets tested without a network.
+  --selftest-parse)
+    selftest_v=$(weather_extract_temp) || exit 1
+    [[ -n "$selftest_v" ]] && wx_temp_ok "$selftest_v" || exit 1
+    printf '%s\n' "$selftest_v"; exit 0 ;;
   "") : ;;
   *) printf '%s: unknown argument %q (try --help)\n' "$PROGNAME" "$1" >&2; exit 2 ;;
 esac
 
 # From here we actually run, so a sensor is mandatory.
 [[ -n "$TEMP_SRC" ]] || die "no usable temperature sensor found (looked for x86_pkg_temp, coretemp, acpitz) — nothing to guard"
+if (( ADAPTIVE_ON )) && (( ! CAN_CAP && ! HAVE_PSTATE )); then
+  die "ADAPTIVE=yes but this machine can neither cap power ($CAP_WHY) nor clamp P-state ($PSTATE_WHY) — the adaptive engine has nothing to act on"
+fi
 
 # =============================================================== startup ======
 (( TRACE_OK )) || log "warning: $TRACE not writable — tracing to the journal only"
@@ -419,6 +1945,37 @@ trap restore_and_exit TERM INT
 if [[ "$DISABLE_TURBO" == yes ]]; then
   set_turbo 1 && log "turbo disabled"
 fi
+
+# The engine has to fill the plan in BEFORE the baseline is established, or the
+# daemon would apply stock power and then immediately cap it again one tick
+# later. With an engine-owned plan and no weather yet, this means the machine
+# starts capped at the fallback budget: a deliberate change from "no config =
+# cap nothing", justified because ADAPTIVE=yes is an explicit opt-in and this is
+# the fail-safe direction.
+ADAPTIVE_START_DESC=""
+if (( ADAPTIVE_ON )); then
+  adaptive_init
+  if plan_pinned; then
+    ADAPTIVE_START_DESC="advisory only (your NORMAL_WATTS/TIERS is pinned); at ${AMBIENT_VAL}C ambient the engine would use $(plan_describe)"
+  else
+    adaptive_start_sig=$(plan_signature)
+    if plan_commit_or_constant; then
+      PLAN_SIG_ACTIVE=$adaptive_start_sig; PLAN_DESC=$(plan_describe)
+      PLAN_BUDGET_ACTIVE=$PROP_BUDGET; PLAN_MODE_ACTIVE_PREV=$PROP_MODE
+      ADAPTIVE_START_DESC="$PLAN_DESC (ambient ${AMBIENT_VAL}C, $AMBIENT_SRC)"
+    else
+      # Loud, because ADAPTIVE=yes and no plan means nothing is capping.
+      log "warning: the adaptive engine could not build ANY usable plan (mode $PROP_MODE, budget ${PROP_BUDGET}W, CRIT_C ${CRIT_C}C, Tjmax ${TJMAX}C) — nothing is capping power. Check CRIT_C and WARN_C against Tjmax."
+      # Both slugs stay inside the closed RESULT vocabulary: nothing
+      # engine-owned is in force (static), because the plan could not be built.
+      PLAN_MODE=static; PLAN_REASON=ladder-cannot-release
+      PLAN_BUDGET="-"; PLAN_BUDGET_SRC="-"; PLAN_TIERS_CSV="-"; PLAN_CLAMP="-"
+      ADAPTIVE_START_DESC="NO USABLE PLAN — not capping power"
+    fi
+  fi
+  (( WEATHER_ON )) && schedule_first_fetch
+fi
+
 # Establish the baseline. If an earlier run left a cap in the hardware, this
 # clears it rather than inheriting a limit nobody asked for.
 if [[ -n "$NORMAL_WATTS" ]]; then
@@ -433,7 +1990,22 @@ else
 fi
 set_perf_pct 100
 
-log "started v$VERSION: sensor=$TEMP_SRC tjmax=${TJMAX}C warn=${WARN_C}C crit=${CRIT_C}C recover=${RECOVER_C}C action=$CRIT_ACTION budget=${NORMAL_WATTS:-stock}"
+log "started v$VERSION: sensor=$TEMP_SRC tjmax=${TJMAX}C warn=${WARN_C}C crit=${CRIT_C}C recover=${RECOVER_C}C action=$CRIT_ACTION budget=${NORMAL_WATTS:-stock}${ADAPTIVE_START_DESC:+ adaptive=on plan=$ADAPTIVE_START_DESC}"
+
+if (( ADAPTIVE_ON )); then
+  if (( ${#ADAPTIVE_NOTES[@]} )); then
+    for note in "${ADAPTIVE_NOTES[@]}"; do log "$note"; done
+  fi
+  # The whole safety of the adaptive engine rests on CRIT_C encoding an observed
+  # death point. On a machine that dies below Tjmax — the case this tool exists
+  # for — a Tjmax-derived CRIT_C makes every budget below it too generous.
+  if [[ -z "$CRIT_C_FROM_CONFIG" ]]; then
+    log "warning: ADAPTIVE=yes with a Tjmax-derived CRIT_C (${CRIT_C}C) — the adaptive budget aims for ${DIE_TARGET_C}C. If your machine misbehaves BELOW Tjmax, read your trace and set CRIT_C first, or this budget is too generous."
+  fi
+  if [[ "$RTHETA_SRC" == derived ]]; then
+    log "note: RTHETA_C_PER_W is not set, so thermal resistance is assumed at $RTHETA_OUT C/W — measure it under a sustained load and set it, the whole budget scales with this number"
+  fi
+fi
 
 # Thresholds are meant to be edited and the failure modes are quiet, so warn.
 if [[ "$LEGACY_MODE" == yes ]]; then
@@ -461,6 +2033,13 @@ while :; do
       sync -f "$TRACE" 2>/dev/null || sync
       rotate_trace
     fi
+  fi
+
+  # Neither of these ever blocks: weather_tick only starts and reaps a detached
+  # child, and plan_tick only reads a cache file that child already wrote.
+  if (( ADAPTIVE_ON )); then
+    (( WEATHER_ON )) && weather_tick
+    plan_tick "$t"
   fi
 
   n_tiers=${#TIER_T[@]}

@@ -48,14 +48,26 @@ fi
 
 echo "=== 4/4  what was detected on this machine ==="
 echo
-"$BIN" --detect | sed 's/^/   /'
+DETECT=$("$BIN" --detect 2>&1) || true
+printf '%s\n' "$DETECT" | sed 's/^/   /'
 
 echo
 echo "=============================================================="
-echo "Installed in MONITOR-ONLY mode. Nothing is capped yet."
-echo
-echo "To opt in to a power cap, edit $CONF, set NORMAL_WATTS, then:"
-echo "   sudo systemctl restart thermal-guard"
+# This banner used to assert monitor-only unconditionally, which is false on any
+# upgrade over an existing config — and false in the worst direction, telling
+# someone their CPU is unguarded while it is in fact being capped. Read the
+# effective configuration back out of --detect rather than asserting it.
+if printf '%s\n' "$DETECT" | grep -q 'Nothing will be capped'; then
+  echo "Installed in MONITOR-ONLY mode. Nothing is capped yet."
+  echo
+  echo "To opt in to a power cap, edit $CONF, set NORMAL_WATTS, then:"
+  echo "   sudo systemctl restart thermal-guard"
+else
+  echo "Installed, and ENFORCING the configuration shown above."
+  echo
+  echo "To change it, edit $CONF, then:"
+  echo "   sudo systemctl restart thermal-guard"
+fi
 echo
 echo "Watch it:      journalctl -fu thermal-guard"
 echo "Temperatures:  tail -f /var/log/thermal-trace.log"

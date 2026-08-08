@@ -14,7 +14,7 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck -S warning thermal-guard install.sh uninstall.sh
+        run: shellcheck -S warning thermal-guard install.sh uninstall.sh tests/run-tests.sh
 
   smoke:
     name: smoke test
@@ -86,3 +86,47 @@ jobs:
           THERMAL_GUARD_CONFIG=/tmp/tg.conf ./thermal-guard --detect \
             | grep -qE 'baseline budget *: 11' || { echo "FAIL: baseline not applied"; exit 1; }
           echo "baseline + ladder parsed correctly"
+
+  tests:
+    name: test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole suite: ground truth against the two measured points on the
+      # reference machine, monotonicity of the budget across a temperature
+      # sweep, the fail-safe path for unknown/stale/corrupt/hostile weather,
+      # backward compatibility with every config that worked in v1.1.0, the
+      # validation of all 29 new keys, and the JSON parser's security boundary.
+      #
+      # It needs no temperature sensor, no RAPL, no root and no network: all
+      # physics goes through --simulate, hardware values are pinned by fixture
+      # files and $THERMAL_GUARD_ASSUME_*, and stub curl/wget on PATH turn any
+      # attempt to reach the network into a test failure.
+      - name: Run tests/run-tests.sh
+        run: bash tests/run-tests.sh
+
+      # The privacy promise, asserted once more from outside the suite so it
+      # cannot be weakened by a change inside it: with no adaptive keys set,
+      # nothing this daemon does opens a socket.
+      - name: The default configuration must never touch the network
+        run: |
+          mkdir -p /tmp/tg-stub /tmp/tg-state
+          for p in curl wget; do
+            printf '#!/bin/sh\ntouch /tmp/tg-network-was-used\nexit 1\n' > "/tmp/tg-stub/$p"
+            chmod +x "/tmp/tg-stub/$p"
+          done
+          export PATH="/tmp/tg-stub:$PATH" THERMAL_GUARD_STATE=/tmp/tg-state
+          export THERMAL_GUARD_ASSUME_TJMAX_C=105 THERMAL_GUARD_ASSUME_STOCK_W=17
+          rm -f /tmp/tg-network-was-used
+          : > /tmp/tg-empty.conf
+          THERMAL_GUARD_CONFIG=/tmp/tg-empty.conf ./thermal-guard --detect      > /dev/null
+          THERMAL_GUARD_CONFIG=/tmp/tg-empty.conf ./thermal-guard --simulate 25 > /dev/null
+          printf 'ADAPTIVE=yes\nAMBIENT_C=25\n' > /tmp/tg-adaptive.conf
+          THERMAL_GUARD_CONFIG=/tmp/tg-adaptive.conf ./thermal-guard --simulate ambient=25 > /dev/null
+          THERMAL_GUARD_CONFIG=/tmp/tg-adaptive.conf ./thermal-guard --detect          > /dev/null
+          timeout 8 env THERMAL_GUARD_CONFIG=/tmp/tg-empty.conf ./thermal-guard || true
+          if [ -e /tmp/tg-network-was-used ]; then
+            echo "FAIL: thermal-guard reached for the network"; exit 1
+          fi
+          echo "no network was used"
