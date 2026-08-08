@@ -56,6 +56,12 @@ grep -v '^#' "$T" | awk -F, 'NF==3' | tail -"$SAMPLES" |
              hot, (hot ? "  <- check what your machine actually misbehaves at" : "")
     }'
 
+# The AMBIENT line reports the value the engine used AND, in parentheses, the raw
+# reading it was derived from. Those differ once a reading starts ageing toward the
+# fallback, and printing only one of them makes the budget look arbitrary.
+amb=$(grep '^# .* AMBIENT ' "$T" | tail -1)
+[[ -n "$amb" ]] && printf 'outside: %s\n' "${amb#*AMBIENT }"
+
 printf 'plans  : %s change(s), %s ambient fallback(s)\n' \
   "$(grep -c '^# .* PLAN ' "$T")" \
   "$(grep '^# .* AMBIENT ' "$T" | grep -c fallback)"

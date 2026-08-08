@@ -790,19 +790,37 @@ samples: 5389 over 3h00m (2.0s apart)
 power
   applied now  : 17.0W   (live RAPL register on THIS machine)
   last applied : stock, no cap   (from the tier events in the trace)
-  plan         : ladder, budget 10.5W
-  ladder steps : baseline stock (uncapped)  ->  80C: 10.5W  ->  85C: 6.5W
+  plan         : ladder, budget 10W
+  ladder steps : baseline stock (uncapped)  ->  80C: 10W  ->  85C: 6.5W
+
+outside
+  reading      : 25.5C   (45m01s old when last used)
+  used as      : 27.9C   (aged toward the conservative fallback, which is what shrinks the budget)
+  in window    : min 22.6C  max 25.5C   (7 update(s), 2 fallback(s))
 
 temperature
-  min 63C   mean 67.8C   max 85C
-  at or above 80C : 10m41s (5.9%)
+  min 61C   mean 68.0C   max 85C
+  at or above 80C : 10m40s (4.5%)
   at or above 85C : 8s (0.1%)
 
-clamp episodes: 1   total 12m30s (6.9% of the window)
-  #   started    lasted    peak   held at
-  1   09:27:18   12m30s    85C    11.5W
+clamp episodes: 1   total 12m30s (5.2% of the window)
+  #   started    lasted    peak   held at  outside
+  1   09:27:18   12m30s    85C    11.5W    22.6C
   longest 12m30s, shortest 12m30s, mean 12m30s
 ```
+
+Read together, those four blocks are one story: it was **22.6 °C outside** when the
+clamp ran, so the budget then was **11.5 W**; it is **25.5 °C** now and that reading is
+**45 minutes old**, so it has been aged to **27.9 °C** and the budget has come down to
+**10 W**. Without the `outside` block the budget looks like it moved for no reason.
+
+`reading` is the raw figure the weather service returned; `used as` is what the engine
+actually computed with after ageing it toward the conservative fallback, and the two
+are shown separately precisely because they disagree — a plan sized for 27.9 °C on a
+25.5 °C day reads as a bug until you can see the ageing. On an indoor machine `reading`
+is the outdoor temperature and `used as` is the room estimate after the coupling model.
+The `outside` column on each episode is the reading at the time **that episode ran**,
+not now. The whole block is omitted for a trace with no ambient events.
 
 The **power** block is what makes the rest interpretable. `applied now` is the live
 RAPL register and is labelled as *this* machine, never merged with the trace-derived
