@@ -783,20 +783,37 @@ it actually ran:
 ```
 
 ```
-== thermal-guard: last 1h of /var/log/thermal-trace.log ==
-window : since 2026-08-08 09:16:18
-samples: 1773 over 1h00m (2.0s apart)
+== thermal-guard: last 3h of /var/log/thermal-trace.log ==
+window : since 2026-08-08 07:58:05
+samples: 5389 over 3h00m (2.0s apart)
+
+power
+  applied now  : 17.0W   (live RAPL register on THIS machine)
+  last applied : stock, no cap   (from the tier events in the trace)
+  plan         : ladder, budget 10.5W
+  ladder steps : baseline stock (uncapped)  ->  80C: 10.5W  ->  85C: 6.5W
 
 temperature
-  min 63C   mean 71.2C   max 85C
-  at or above 80C : 10m41s (17.8%)
-  at or above 85C : 8s (0.2%)
+  min 63C   mean 67.8C   max 85C
+  at or above 80C : 10m41s (5.9%)
+  at or above 85C : 8s (0.1%)
 
-clamp episodes: 1   total 12m30s (20.8% of the window)
-  #   started    lasted    peak
-  1   09:27:18   12m30s    85C
+clamp episodes: 1   total 12m30s (6.9% of the window)
+  #   started    lasted    peak   held at
+  1   09:27:18   12m30s    85C    11.5W
   longest 12m30s, shortest 12m30s, mean 12m30s
 ```
+
+The **power** block is what makes the rest interpretable. `applied now` is the live
+RAPL register and is labelled as *this* machine, never merged with the trace-derived
+figures — reading a trace copied from another box is a supported use, and quietly
+presenting your watts as its watts would mislead in exactly the situation where
+someone is working out what killed something. `ladder steps` is the plan the engine
+last committed, and `held at` is the budget that was in force **during that episode**,
+which is not necessarily the one in force now: in the sample above the episode ran at
+11.5 W and the current plan is 10.5 W, because the afternoon warmed up by 3 °C and the
+engine stepped the budget down. A trace with no tier events shows `?` rather than
+guessing.
 
 Durations come from the timestamps, not from a sample count times an assumed
 `POLL_SEC` — the daemon can be restarted with a different interval, and a laptop can
