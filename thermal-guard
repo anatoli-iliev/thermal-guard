@@ -81,6 +81,11 @@ ADAPTIVE_CLAMP_OFFSET_W=0  # watts added to the emergency clamp the engine deriv
 ADAPTIVE_BUDGET_OFFSET_W=0 # watts added to the working budget — the rung between the
                            # first and the emergency rung. Ladder plans only, and never
                            # past the point where the die would settle on the top rung.
+ADAPTIVE_CLAMP_MAX_W=9     # hard ceiling on the emergency clamp the engine derives, in
+                           # both plan shapes. Set empty for no ceiling. Bounds the engine,
+                           # not an explicit TIERS/CLAMP_WATTS, exactly like BUDGET_MAX_W.
+                           # 9 suits a ~17W-class laptop; on a larger part it will sit
+                           # under BUDGET_MIN_W, which outranks it and says so.
 LADDER_MIN_WINDOW_C=8      # burst window below the first rung before a ladder beats a flat cap
 LADDER_IDLE_RISE_C=""      # die rise above ambient at light load. Empty = 0.45 x Rtheta x stock
 WEATHER_URL=""             # empty = the built-in Open-Meteo endpoint
@@ -256,6 +261,9 @@ is_num "$ADAPTIVE_CLAMP_OFFSET_W" \
   || die "ADAPTIVE_CLAMP_OFFSET_W must be a number >= 0 (got '$ADAPTIVE_CLAMP_OFFSET_W')"
 is_num "$ADAPTIVE_BUDGET_OFFSET_W" \
   || die "ADAPTIVE_BUDGET_OFFSET_W must be a number >= 0 (got '$ADAPTIVE_BUDGET_OFFSET_W')"
+[[ -z "$ADAPTIVE_CLAMP_MAX_W" ]] \
+  || { is_num "$ADAPTIVE_CLAMP_MAX_W" && awk -v x="$ADAPTIVE_CLAMP_MAX_W" 'BEGIN{exit !(x>0)}'; } \
+  || die "ADAPTIVE_CLAMP_MAX_W must be a number greater than zero (got '$ADAPTIVE_CLAMP_MAX_W')"
 is_num "$LADDER_MIN_WINDOW_C" \
   || die "LADDER_MIN_WINDOW_C must be a number >= 0 (got '$LADDER_MIN_WINDOW_C')"
 [[ -z "$LADDER_IDLE_RISE_C" ]] || is_num "$LADDER_IDLE_RISE_C" \
@@ -510,6 +518,13 @@ if (( ADAPTIVE_ON )); then
   # fire on a value someone typed.)
   if awk -v a="$BUDGET_MAX_W" -v b="$STOCK_W" 'BEGIN{exit !(a>b)}'; then
     ADAPTIVE_NOTES+=("warning: BUDGET_MAX_W (${BUDGET_MAX_W}W) is above the stock power limit this run detected (${STOCK_W}W, from $STOCK_SRC) — your ${BUDGET_MAX_W}W is what the engine uses. If ${STOCK_W}W is not your CPU's rating that reading is stale, and LADDER_IDLE_RISE_C is derived from it too")
+  fi
+  # A ceiling under the usability floor is a contradiction, and the floor wins.
+  # Say so by name rather than leaving someone to wonder why a 3W ceiling produced
+  # a 4.25W clamp.
+  if [[ -n "$ADAPTIVE_CLAMP_MAX_W" ]] \
+     && awk -v a="$ADAPTIVE_CLAMP_MAX_W" -v b="$BUDGET_MIN_W" 'BEGIN{exit !(a<b)}'; then
+    ADAPTIVE_NOTES+=("warning: ADAPTIVE_CLAMP_MAX_W (${ADAPTIVE_CLAMP_MAX_W}W) is below BUDGET_MIN_W (${BUDGET_MIN_W}W, $BUDGET_MIN_SRC) — the usability floor wins and the clamp will not go under ${BUDGET_MIN_W}W. Lower BUDGET_MIN_W too if you meant it")
   fi
   # A snapshot below the rating means an earlier run saved the register while the
   # package was already capped. Harmless for the engine, which now reads the
@@ -1232,7 +1247,8 @@ plan_compute() {
             -v amode="$ADAPTIVE_MODE" -v curmode="$PLAN_MODE_ACTIVE" \
             -v topf="$LADDER_TOP_FACTOR" -v hyst="$TIER_HYSTERESIS_CFG" \
             -v clampoff="$ADAPTIVE_CLAMP_OFFSET_W" \
-            -v budgetoff="$ADAPTIVE_BUDGET_OFFSET_W" 'BEGIN{
+            -v budgetoff="$ADAPTIVE_BUDGET_OFFSET_W" \
+            -v clampmax="${ADAPTIVE_CLAMP_MAX_W:-0}" 'BEGIN{
     b = (target - amb) / rth
     if (b < 0) b = 0
     # The 1e-9 is required, not defensive: a value that is exactly 11.0 can be
@@ -1300,6 +1316,12 @@ plan_compute() {
       wtop = (wp < wr) ? wp : wr
       if (wtop < 0) wtop = 0
       wtop = int(wtop / step + 1e-9) * step
+      # ADAPTIVE_CLAMP_MAX_W. Applied before the BUDGET_MIN_W floor below, so the
+      # usability floor still has the last word: a ceiling under that floor is a
+      # contradiction, and the floor is the one that keeps the machine usable.
+      # Quantised down like every other engine watt, so a ceiling off the step
+      # grid cannot put a rung off it either.
+      if (clampmax > 0 && wtop > clampmax) wtop = int(clampmax / step + 1e-9) * step
       if (wtop < bmin) { wtop = bmin; floored = 1 }
       # Four separate ways a ladder can be unbuildable, kept separate because
       # they need four different sentences from the user. All of them fall
@@ -1324,6 +1346,7 @@ plan_compute() {
     # (No apostrophes in this block: it lives inside a single-quoted awk program.)
     cl = b * 0.7 + clampoff
     if (cl > b) cl = b
+    if (clampmax > 0 && cl > clampmax) cl = clampmax
     if (cl < 1) cl = 1
     printf "%g %s %.1f %.1f %s %s %g %.2f %s %.1f\n", \
       b, bsrc, idle, win, mode, why, wtop, cl, rej, amb + rth * b
@@ -1780,6 +1803,9 @@ print_adaptive() {
   if awk -v x="$ADAPTIVE_BUDGET_OFFSET_W" 'BEGIN{exit !(x>0)}'; then
     printf "$f" 'budget offset' "+${ADAPTIVE_BUDGET_OFFSET_W}W asked for on the working rung (ladder plans only, trimmed to keep the die under ${RUNGTOP_T}C)"
   fi
+  if [[ -n "$ADAPTIVE_CLAMP_MAX_W" ]]; then
+    printf "$f" 'clamp ceiling' "${ADAPTIVE_CLAMP_MAX_W}W — the engine clamp never exceeds this, in either plan shape"
+  fi
   printf "$f" mode "${PROP_MODE^^}"
   print_plan_reason "$f" '                       '
   if plan_pinned; then
@@ -1964,6 +1990,9 @@ print_simulate() {   # $1 = <outdoor C> | ambient=<c> | unknown
   fi
   if awk -v x="$ADAPTIVE_BUDGET_OFFSET_W" 'BEGIN{exit !(x>0)}'; then
     printf "$f" 'budget offset' "+${ADAPTIVE_BUDGET_OFFSET_W}W asked for   (the die must settle under the ${RUNGTOP_T}C rung, so at most $(awk -v rt="$RUNGTOP_T" -v a="$AMBIENT_VAL" -v r="$RTHETA" 'BEGIN{printf "%.2f", (rt-a)/r}')W here)"
+  fi
+  if [[ -n "$ADAPTIVE_CLAMP_MAX_W" ]]; then
+    printf "$f" 'clamp ceiling' "${ADAPTIVE_CLAMP_MAX_W}W       (hard limit on the engine clamp, whatever the weather)"
   fi
   if (( unbuildable )); then
     printf "$f" decision 'NO USABLE PLAN — would not cap power'

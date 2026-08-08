@@ -534,6 +534,51 @@ Neither key changes when a clamp *releases*: that is set by the rung temperature
 `TIER_HYSTERESIS`, not by watts. An 8.5 W clamp at the 85 °C rung still releases below
 78 °C, exactly as a 7 W one did.
 
+### Putting a ceiling on the clamp
+
+The offsets push a number up; `ADAPTIVE_CLAMP_MAX_W` stops one climbing. The clamp is
+a fraction of the working budget, and that budget grows as it gets colder, so the
+clamp grows with it — on this machine `85:7.5` at 20 °C ambient becomes `85:12` at
+−5 °C. That is honest physics (a cold machine really can shed 12 W at 85 °C), but it
+may be more than you want the emergency rung ever handing out, and no other key says
+"never above this" — `BUDGET_MAX_W` ceilings the working budget, not the clamp.
+
+**It defaults to 9 W**, which is sized for the ~17 W-class laptop this project was
+measured on. On a larger part that default sits below `BUDGET_MIN_W` (25 % of stock,
+so 31 W on a 125 W CPU); the floor outranks it and `--detect` names the conflict, but
+you should set a proportionate value or turn it off:
+
+```bash
+ADAPTIVE_CLAMP_MAX_W=9      # the default
+ADAPTIVE_CLAMP_MAX_W=       # empty: no ceiling, as before this key existed
+```
+
+| ambient | without | with `ADAPTIVE_CLAMP_MAX_W=9` |
+|---|---|---|
+| −5 °C | `80:17 85:12` | `80:17 85:9` |
+| 0 °C | `80:16 85:11` | `80:16 85:9` |
+| 10 °C | `80:14 85:10` | `80:14 85:9` |
+| 18 °C | `80:12.5 85:9` | `80:12.5 85:9` — already under |
+| 30 °C | `80:10 85:7.5` | `80:10 85:7.5` — untouched |
+
+It holds in **both** plan shapes — the ladder top rung and the constant-cap clamp are
+derived by different routes, and one key covers both — and it can only ever *lower* a
+clamp. A ceiling above the derived number does nothing at all.
+
+It loses to `BUDGET_MIN_W`. A ceiling under the usability floor is a contradiction, so
+the floor wins and `--detect` names the conflict rather than leaving you to wonder why
+a 3 W ceiling produced a 4.25 W clamp:
+
+```
+  clamp ceiling      : 3W — the engine clamp never exceeds this, in either plan shape
+  note               : warning: ADAPTIVE_CLAMP_MAX_W (3W) is below BUDGET_MIN_W (4.25W,
+                       derived) — the usability floor wins and the clamp will not go
+                       under 4.25W. Lower BUDGET_MIN_W too if you meant it
+```
+
+Like `BUDGET_MAX_W`, it bounds what the **engine** derives. An explicit `TIERS` or
+`CLAMP_WATTS` is your own number and still wins outright.
+
 ### When it cannot reach the weather service
 
 **It fails safe, never optimistic.** Every one of these lands in the same place —
@@ -781,6 +826,7 @@ one costs you.
 | `LADDER_TOP_FACTOR` | `0.65` | Top-rung watts as a fraction of the budget, reduced further if the rung could not release |
 | `ADAPTIVE_CLAMP_OFFSET_W` | `0` | Watts added to the engine's emergency clamp, keeping the plan adaptive. Trimmed to whatever the release bound allows, so it is a request rather than a floor |
 | `ADAPTIVE_BUDGET_OFFSET_W` | `0` | Watts added to the working rung — the band between the first and emergency rungs. Ladder plans only, and trimmed to keep the die settling below the emergency rung, since a ladder that cannot hold becomes a constant cap |
+| `ADAPTIVE_CLAMP_MAX_W` | `9` | Hard ceiling on the engine's emergency clamp, in both plan shapes and at every ambient. Only ever lowers a clamp; loses to `BUDGET_MIN_W`. Set empty for no ceiling. Sized for a ~17 W laptop — raise it on a larger part |
 | `LADDER_MIN_WINDOW_C` | `8` | Minimum burst window before a ladder beats a flat cap. ±2 °C of hysteresis around it |
 | `LADDER_IDLE_RISE_C` | `0.45 × Rθ × stock` | Die rise above ambient at light load. Decides the crossover — worth measuring |
 | `WEATHER_URL` | Open-Meteo | `https://` only. Must return a `current` object with a numeric `temperature_2m` |

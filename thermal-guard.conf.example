@@ -472,6 +472,35 @@
 # settle limit next to the request so you can see how much of it landed.
 #ADAPTIVE_BUDGET_OFFSET_W=0
 
+# A hard ceiling on the emergency clamp the engine derives. Defaults to 9 W. Set
+# it EMPTY for no ceiling, which is what every version before this one did.
+#
+# 9 is sized for a ~17 W-class laptop, the machine this project was measured on.
+# On a larger part it will sit below BUDGET_MIN_W (which defaults to 25% of the
+# stock limit — 31 W on a 125 W CPU), and the floor outranks it, so the effective
+# behaviour there is the floor plus a warning naming the conflict. If your machine
+# is not a small laptop, either raise this to something proportionate or empty it.
+#
+# The clamp is a fraction of the working budget, and that budget rises as it gets
+# colder — so the clamp rises too. On the reference machine it is 7.5W at 20C
+# outside and 12W at -5C. That is correct as physics (a cold machine really can
+# shed 12W at 85C) but it may be more than you want the emergency rung to ever
+# hand out, and no other key expresses "never above this". BUDGET_MAX_W ceilings
+# the working budget, not the clamp.
+#
+# Applies in BOTH plan shapes: the ladder top rung and the constant-cap clamp,
+# which are derived by different routes and would otherwise need two keys. It can
+# only ever LOWER a clamp — a ceiling above the derived number changes nothing.
+#
+# It loses to BUDGET_MIN_W. A ceiling under the usability floor is a
+# contradiction, and the floor is the one that keeps the machine usable, so the
+# floor wins and --detect says so by name rather than leaving you to wonder why a
+# 3W ceiling produced a 4.25W clamp.
+#
+# Like BUDGET_MAX_W, it bounds what the ENGINE derives. An explicit TIERS or
+# CLAMP_WATTS is your own number and still wins outright.
+#ADAPTIVE_CLAMP_MAX_W=
+
 # The ladder-versus-constant test, in one number.
 #
 # A ladder only pays for itself while the die at LIGHT load sits well below the
