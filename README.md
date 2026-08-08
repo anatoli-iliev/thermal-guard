@@ -467,6 +467,73 @@ The first is byte-identical to
 [`examples/asus-s550ca-tiered.conf`](examples/asus-s550ca-tiered.conf), chosen
 automatically.
 
+### Nudging the engine without pinning it
+
+Sooner or later the engine hands you a number you would like to be a little larger.
+The obvious move — writing `TIERS` or `CLAMP_WATTS` into the config — is a much
+bigger change than it looks: **any explicit plan pins the whole thing**
+(`mode=static`, `budget_src=config`) and the weather stops being consulted at all.
+You would keep your watt on a cold night and keep it on a 40 °C afternoon too.
+
+Two keys move one number each and leave the rest adaptive:
+
+| ambient | plain | `ADAPTIVE_CLAMP_OFFSET_W=1` | `ADAPTIVE_BUDGET_OFFSET_W=1` |
+|---|---|---|---|
+| 15 °C | `80:12.5 85:8` | `80:12.5 85:9` | `80:13 85:8` |
+| 20 °C | `80:12 85:7.5` | `80:12 85:8.5` | `80:12 85:7.5` |
+| 25 °C | `80:11 85:7` | `80:11 85:8` | `80:11 85:7` |
+| 30 °C | `80:10 85:6.5` | `80:10 85:7.5` | `80:10 85:6.5` |
+| 34 °C | constant 9 W, clamp 6.30 W | constant 9 W, clamp **7.30 W** | constant 9 W, clamp 6.30 W |
+
+**Neither is a floor.** Both are requests, trimmed by the physics that would
+otherwise be violated — and the two are bounded by *different* limits, which is why
+they behave so differently in that table.
+
+`ADAPTIVE_CLAMP_OFFSET_W` raises the emergency rung, bounded by the **release
+budget**: the power above which the rung settles the die above its own release
+temperature and can never let go. That was a measured failure — a clamp stuck for
+11 minutes in the field — so the offset is added *inside* that bound. There is
+usually room there, which is why the full watt lands at every row above.
+
+`ADAPTIVE_BUDGET_OFFSET_W` raises the working rung, and its bound is much tighter,
+because the working rung **settles the die by construction**: at budget B and
+ambient A the die comes to rest at `A + Rtheta × B`. Push B until that resting point
+reaches the emergency rung and the rung engages under ordinary load — the engine
+rejects such a ladder outright and falls back to a constant cap, which would cap the
+machine at *every* temperature and cost you the uncapped band under the first rung.
+Asking for more would end in less, so the request is trimmed instead.
+
+That bound is worth stating in watts, because it is small. All this key can ever hand
+you is the slack between the die target and the emergency rung:
+
+```
+(85 °C rung − 83 °C die target) ÷ 5.24 C/W = 0.38 W   on a 0.5 W quantisation step
+```
+
+So on this machine it yields **+0.5 W or nothing**, never the full watt, whatever you
+set it to — `+0.5 W` at 15/18/21/23/28 °C, nothing at 25 or 30 °C where the step
+boundary falls the wrong way. If you want more than that, no offset will do it: the
+lever is `DIE_TARGET_C`/`CRIT_C` (deciding to run the die hotter) or a genuinely lower
+`RTHETA_C_PER_W` (better cooling, measured rather than wished for).
+
+The watts it does hand you come out of `DIE_TARGET_MARGIN_C`, which covers
+package-versus-hottest-core error, die ripple and ambient error. A die that settled at
+80.9 °C now settles at 83.6 °C — still under the rung, with less room to wobble before
+the clamp fires, so expect more clamp episodes on a marginal day.
+[`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh) is how you check that.
+
+`--detect` and `--simulate` print the governing bound beside each request, so you can
+see how much of it actually landed:
+
+```
+  clamp offset             +1W asked for   (release budget here is 9.48W — the offset is trimmed to fit under it)
+  budget offset            +1W asked for   (the die must settle under the 85C rung, so at most 11.77W here)
+```
+
+Neither key changes when a clamp *releases*: that is set by the rung temperature and
+`TIER_HYSTERESIS`, not by watts. An 8.5 W clamp at the 85 °C rung still releases below
+78 °C, exactly as a 7 W one did.
+
 ### When it cannot reach the weather service
 
 **It fails safe, never optimistic.** Every one of these lands in the same place —
