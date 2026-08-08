@@ -732,6 +732,163 @@ diff what the daemon is doing against what it says it would do.
 
 ---
 
+## Monitoring it day to day
+
+Every recipe below is a one-liner against `/var/log/thermal-trace.log` or the journal.
+Nothing else to install. The `awk -F, 'NF==3'` guard skips event lines and also skips
+traces written by 1.0.x, which used a different sample format.
+
+```bash
+T=/var/log/thermal-trace.log
+```
+
+### Watching it live
+
+```bash
+journalctl -fu thermal-guard        # decisions as they happen
+tail -f "$T" | grep '^#'            # the same, but survives a power cut
+watch -n2 thermal-guard --detect    # a dashboard: plan, ambient, budget, temps
+```
+
+### Is it throttling me right now?
+
+The fraction of samples spent above the baseline. At 2 s polling, 1800 samples is the
+last hour.
+
+```bash
+grep -v '^#' "$T" | awk -F, 'NF==3' | tail -1800 |
+  awk -F, '{n++; c+=$3} END{if(n) printf "%d samples, %.1f%% clamped\n", n, 100*c/n}'
+```
+
+```
+1800 samples, 20.4% clamped
+```
+
+A few percent is a ladder doing its job. Sustained high numbers mean the budget is
+below what your workload wants — either the weather turned, or the machine wants a
+constant cap rather than a ladder. Check which with the plan history below.
+
+### How hot did it actually get?
+
+```bash
+grep -v '^#' "$T" | awk -F, 'NF==3{t=$2+0; n++; s+=t; if(t>m)m=t;
+  if(t>=80)h80++; if(t>=85)h85++}
+  END{printf "n=%d  mean=%.1fC  peak=%.0fC  >=80C %.1f%%  >=85C %.1f%%\n",
+      n, s/n, m, 100*h80/n, 100*h85/n}'
+```
+
+```
+n=21501  mean=66.3C  peak=85C  >=80C 2.6%  >=85C 0.0%
+```
+
+Per hour, which is where a heat problem shows up as a pattern rather than a spike:
+
+```bash
+grep -v '^#' "$T" | awk -F, 'NF==3{split($1,a,"T"); split(a[2],b,":");
+  k=a[1]" "b[1]":00"; t=$2+0; if(t>m[k])m[k]=t}
+  END{for(k in m) printf "%s  peak %.0fC\n", k, m[k]}' | sort | tail -12
+```
+
+And the question that matters most on a machine that cuts power below Tjmax — did it
+ever get close?
+
+```bash
+grep -v '^#' "$T" | awk -F, 'NF==3 && $2+0>=86' | tail -5
+```
+
+Empty output is the answer you want. Set the threshold to a couple of degrees under
+whatever temperature *your* machine misbehaves at, not under Tjmax.
+
+### What is in force right now?
+
+```bash
+grep '^# .* RESULT ' "$T" | tail -1
+```
+
+Or just the fields you care about:
+
+```bash
+grep '^# .* RESULT ' "$T" | tail -1 | tr ' ' '\n' |
+  grep -E 'mode=|reason=|budget_w=|ambient_c=|ambient_src=|ambient_age_sec='
+```
+
+```
+ambient_c=22.6 ambient_src=weather ambient_age_sec=1912
+mode=ladder reason=window-ok budget_w=11.5
+```
+
+### What changed, and why?
+
+```bash
+grep '^# .* PLAN ' "$T"
+```
+
+Every plan change ever, each naming the plan it replaced and the reason. Anything that
+takes performance away is prefixed `warning:`, so this is the first place to look when
+the machine feels slow:
+
+```bash
+grep '^# .*warning: PLAN ' "$T" | tail
+```
+
+### Is the weather path healthy?
+
+```bash
+echo "updates: $(grep -c '^# .* AMBIENT ' "$T")  fallbacks: $(grep '^# .* AMBIENT ' "$T" | grep -c fallback)"
+grep '^# .* AMBIENT ' "$T" | tail -3
+```
+
+```
+updates: 5  fallbacks: 2
+# 2026-08-08T09:50:31+03:00 AMBIENT 22.6C outdoor (outdoor 22.6C, age 1912s, weather)
+```
+
+`age` is how old the reading was when it was used. Fetches are hourly, so ages up to
+~3600 s are normal and the influence of a reading decays as it ages. `ambient_src=fallback`
+means no trusted reading at all and the conservative budget is in force — a couple at
+startup is expected, a steady stream means the network or the endpoint is failing. Two
+things to check then: `LOCATION`/coordinates resolved at all (the `location resolved`
+event line), and whether `curl` or `wget` exists on the box.
+
+### It died. What was in force?
+
+The trace is fsynced every 5 samples, so at most ~10 s is lost to a power cut.
+
+```bash
+tail -40 "$T"                              # the seconds before it went
+grep '^# .* RESULT ' "$T" | tail -1        # the policy that was active
+```
+
+The `RESULT` heartbeat exists for exactly this: temperature alone cannot tell you
+whether the budget in force was 9 W or 17 W, and that is the difference between "the
+cap was too generous" and "the cap held and something else killed it".
+
+### A daily summary
+
+All of the above in one screen — [`contrib/thermal-summary.sh`](contrib/thermal-summary.sh),
+suitable for a cron job or a login shell:
+
+```bash
+./contrib/thermal-summary.sh                              # last 24 h
+./contrib/thermal-summary.sh /var/log/thermal-trace.log 1 # last hour
+```
+
+```
+== thermal-guard: last 24h of /var/log/thermal-trace.log ==
+active : 2026-08-08T09:50:31+03:00 RESULT v=1 ambient_c=22.6 ambient_src=weather ... mode=ladder budget_w=11.5 tiers=80:11.5,85:7
+temps  : mean 66.3C  peak 85C  2.1% clamped  (21548 samples)
+hot    : 5 samples at or above 85C  <- check what your machine actually misbehaves at
+plans  : 1 change(s), 2 ambient fallback(s)
+recent warnings:
+# 2026-08-08T09:18:41+03:00 warning: PLAN ladder TIERS="80:11.5 85:7" (was constant 9W) — window 17.4C vs 8.0C at 22.6C ambient (window-ok)
+```
+
+It reads only the trace, so it also works on a machine where the daemon is not
+running, on a trace copied from another box, and — the case it is really for — after
+a power cut, when the trace is the only witness left.
+
+---
+
 ## Uninstall
 
 ```bash
