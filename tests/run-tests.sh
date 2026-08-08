@@ -1234,6 +1234,60 @@ then pass "a negative budget offset is refused by name"
 else fail "a negative budget offset is refused by name" "rc=$rc out=[$out]"; fi
 
 # ============================================================================
+group "9e. ADAPTIVE_CLAMP_MAX_W — a hard ceiling on the engine clamp"
+# ============================================================================
+# The engine clamp rises as it gets colder, because the budget it is a fraction
+# of rises too. This is the ceiling for someone who wants a number their machine
+# never exceeds whatever the weather does. It must hold in BOTH plan shapes, must
+# only ever lower a clamp, and must lose to BUDGET_MIN_W — a ceiling under the
+# usability floor is a contradiction, and the floor is what keeps the machine
+# usable. Ambient 5C is used because the uncapped clamp there is 9W, well clear
+# of the 6W ceiling under test.
+CAPBASE=('ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' 'CRIT_C=88' 'TIER_HYSTERESIS=7')
+CAPOFF="$WORK/capoff.conf"; mkconf "$CAPOFF" "${CAPBASE[@]}"
+CAP6="$WORK/cap6.conf";     mkconf "$CAP6"   "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W=6'
+CAPHIGH="$WORK/caphigh.conf"; mkconf "$CAPHIGH" "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W=20'
+
+assert_eq "no ceiling set leaves the ground-truth ladder untouched" \
+          "80:11,85:7" "$(rfield tiers <<<"$(sim "$CAPOFF" ambient=25)")"
+
+base5=$(rfield clamp_w <<<"$(sim "$CAPOFF" ambient=5)")
+assert_eq "at 5C the uncapped clamp is 9W (the premise of the tests below)" 9 "$base5"
+assert_eq "a 6W ceiling caps the ladder top rung"    6 "$(rfield clamp_w <<<"$(sim "$CAP6" ambient=5)")"
+assert_eq "a ceiling above the derived clamp changes nothing" \
+          "$base5" "$(rfield clamp_w <<<"$(sim "$CAPHIGH" ambient=5)")"
+assert_eq "the capped rung is still a ladder, not a collapse" \
+          ladder "$(rfield mode <<<"$(sim "$CAP6" ambient=5)")"
+
+# It has to hold in the constant-cap shape too, which derives its clamp by a
+# different route (0.7 x budget, not LADDER_TOP_FACTOR).
+CCON="$WORK/capconst.conf";  mkconf "$CCON"  "${CAPBASE[@]}" 'ADAPTIVE_MODE=constant'
+CCON6="$WORK/capconst6.conf"; mkconf "$CCON6" "${CAPBASE[@]}" 'ADAPTIVE_MODE=constant' 'ADAPTIVE_CLAMP_MAX_W=6'
+cbase=$(rfield clamp_w <<<"$(sim "$CCON" ambient=5)")
+if awk -v x="$cbase" 'BEGIN{exit !(x>6)}'; then
+  assert_eq "the ceiling holds in a constant-cap plan as well" \
+            "6.00" "$(rfield clamp_w <<<"$(sim "$CCON6" ambient=5)")"
+else
+  skip "the ceiling holds in a constant-cap plan as well" "constant clamp at 5C is ${cbase}W, already under the ceiling"
+fi
+
+# The usability floor outranks the ceiling, and says so by name rather than
+# leaving someone to wonder why a 3W ceiling produced a 4.25W clamp.
+CAPLOW="$WORK/caplow.conf"; mkconf "$CAPLOW" "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W=3'
+assert_eq "BUDGET_MIN_W outranks a ceiling beneath it" \
+          "$FLOOR" "$(rfield clamp_w <<<"$(sim "$CAPLOW" ambient=5)")"
+assert_contains "and the conflict is named in --detect" \
+                "$(detect "$CAPLOW")" "is below BUDGET_MIN_W"
+
+for bad in 0 -2 abc; do
+  CAPBAD="$WORK/capbad.conf"; mkconf "$CAPBAD" "${CAPBASE[@]}" "ADAPTIVE_CLAMP_MAX_W=$bad"
+  out=$(sim "$CAPBAD" ambient=25); rc=$(lastrc)
+  if (( rc != 0 )) && [[ "$out" == *ADAPTIVE_CLAMP_MAX_W* ]]
+  then pass "a ceiling of '$bad' is refused by name"
+  else fail "a ceiling of '$bad' is refused by name" "rc=$rc out=[$out]"; fi
+done
+
+# ============================================================================
 group "9b. contrib tools — the newest sample, and how old it is"
 # ============================================================================
 # Both reporting scripts print the most recent temperature in the trace. That
