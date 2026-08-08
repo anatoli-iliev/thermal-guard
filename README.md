@@ -10,8 +10,62 @@
 thermal-guard keeps a CPU inside a thermal envelope it can actually sustain, and
 records what happened if the machine dies anyway.
 
-**Safe by default.** Installing changes nothing about how your machine runs. It
-monitors and records. Capping is something you opt into, after you have data.
+---
+
+## In one minute
+
+**The problem.** Some laptops switch off instantly under heavy load. No warning, no
+error, nothing in the logs. That is because the power is cut *underneath* the
+operating system — Linux never gets the chance to write anything down.
+
+**Why it happens.** The CPU is allowed to draw more power than the laptop's cooling
+can carry away. It overheats, and the board cuts power to protect itself. On many
+machines that happens well below the temperature the CPU itself considers dangerous,
+so the safety net built into Linux never fires. You are left with a dead machine and
+no evidence.
+
+**What this does about it.**
+
+1. **Puts a ceiling on how much power the CPU may draw**, so the chip never gets hot
+   enough for that to happen.
+2. **Steps in harder** if the temperature climbs anyway.
+3. **Writes a temperature reading every two seconds to a file that survives a power
+   cut** — so if the machine does die, you finally have evidence instead of a guess.
+
+**What makes it unusual.** How much power is safe depends on how warm it is *around*
+the machine. The same laptop that is perfectly happy at 11 W in a cool room will die
+at 11 W on a hot balcony. thermal-guard can look up the outdoor temperature for your
+location once an hour and move the ceiling to match: **more power when it is cold,
+less when it is hot.** It also decides *how* to cap — some conditions are better
+served by a fixed limit, others by running at full speed until the chip warms up and
+only then stepping down. It picks, and it tells you why in a sentence you can argue
+with.
+
+**It changes nothing until you ask it to.** A fresh install only watches and records.
+Nothing is capped, nothing is shut down, and nothing is sent over the network. You
+switch things on after you have looked at your own data.
+
+### What is in the box
+
+| | |
+|---|---|
+| **`thermal-guard`** | the daemon: caps power, clamps if needed, records everything |
+| **[`contrib/thermal-summary.sh`](contrib/thermal-summary.sh)** | one screen: what is in force, how hot it has been, what changed |
+| **[`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh)** | the detailed view: every time it had to throttle, for how long, at what power, and how warm it was outside |
+
+### Getting started
+
+```bash
+git clone https://github.com/anatoli-iliev/thermal-guard.git
+cd thermal-guard && sudo ./install.sh     # monitors only — caps nothing
+
+thermal-guard --detect                    # what it found on your machine
+./contrib/thermal-summary.sh              # what it has seen so far
+```
+
+Then leave it running for a day and read [Choosing a power budget](#choosing-a-power-budget).
+If you want it to track the weather for you, see [Adapting to the weather](#adapting-to-the-weather).
+To watch what it is doing, see [Monitoring it day to day](#monitoring-it-day-to-day).
 
 ---
 
