@@ -192,13 +192,14 @@ group "1. every existing CI step still passes"
 # ============================================================================
 n_syn=0
 for f in "$ROOT/thermal-guard" "$ROOT/install.sh" "$ROOT/uninstall.sh" \
-         "$ROOT/thermal-guard.conf.example" "$ROOT"/examples/*.conf "$HERE/run-tests.sh"; do
+         "$ROOT/thermal-guard.conf.example" "$ROOT"/examples/*.conf "$HERE/run-tests.sh" \
+         "$ROOT/contrib/thermal-summary.sh"; do
   bash -n "$f" 2>"$WORK/e" || { fail "bash -n $(basename "$f")" "$(cat "$WORK/e")"; n_syn=1; }
 done
 (( n_syn )) || pass "bash -n on the daemon, both installers, the conf example, every examples/*.conf and this suite"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -S warning "$ROOT/thermal-guard" "$ROOT/install.sh" "$ROOT/uninstall.sh" "$HERE/run-tests.sh" >"$WORK/sc" 2>&1
+  if shellcheck -S warning "$ROOT/thermal-guard" "$ROOT/install.sh" "$ROOT/uninstall.sh" "$HERE/run-tests.sh" "$ROOT/contrib/thermal-summary.sh" >"$WORK/sc" 2>&1
   then pass "shellcheck -S warning is clean"
   else fail "shellcheck -S warning is clean" "$(head -20 "$WORK/sc")"; fi
 else
