@@ -50,7 +50,7 @@ switch things on after you have looked at your own data.
 | | |
 |---|---|
 | **`thermal-guard`** | the daemon: caps power, clamps if needed, records everything |
-| **[`contrib/thermal-summary.sh`](contrib/thermal-summary.sh)** | one screen: what is in force, how hot it has been, what changed |
+| **[`contrib/thermal-summary.sh`](contrib/thermal-summary.sh)** | one screen: what is in force, how hot it is now and has been, what changed |
 | **[`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh)** | the detailed view: every time it had to throttle, for how long, at what power, and how warm it was outside |
 
 ### Getting started
@@ -859,6 +859,7 @@ outside
   in window    : min 22.6C  max 25.5C   (7 update(s), 2 fallback(s))
 
 temperature
+  latest       : 71C   (last sample, 4s ago)
   min 61C   mean 68.0C   max 85C
   at or above 80C : 10m40s (4.5%)
   at or above 85C : 8s (0.1%)
@@ -892,6 +893,14 @@ which is not necessarily the one in force now: in the sample above the episode r
 11.5 W and the current plan is 10.5 W, because the afternoon warmed up by 3 °C and the
 engine stepped the budget down. A trace with no tier events shows `?` rather than
 guessing.
+
+`latest` is the newest sample in the trace, and it is always printed with its age
+because the age is what makes it safe to read. A trace that stopped three hours ago
+still has a newest sample, and on a machine you are looking at *because* it went down
+that is the normal case — `71C (last sample, 3h04m ago)` is a very different statement
+from `71C (last sample, 4s ago)`. The age is computed from the timestamps with
+`date -d`; where that is unavailable the absolute clock time is printed instead
+(`at 09:50:31`), because a wrong interval would be worse than none.
 
 Durations come from the timestamps, not from a sample count times an assumed
 `POLL_SEC` — the daemon can be restarted with a different interval, and a laptop can
@@ -1014,7 +1023,7 @@ suitable for a cron job or a login shell:
 ```
 == thermal-guard: last 24h of /var/log/thermal-trace.log ==
 active : 2026-08-08T09:50:31+03:00 RESULT v=1 ambient_c=22.6 ambient_src=weather ... mode=ladder budget_w=11.5 tiers=80:11.5,85:7
-temps  : mean 66.3C  peak 85C  2.1% clamped  (21548 samples)
+temps  : now 71C (4s ago)  mean 66.3C  peak 85C  2.1% clamped  (21548 samples)
 hot    : 5 samples at or above 85C  <- check what your machine actually misbehaves at
 plans  : 1 change(s), 2 ambient fallback(s)
 recent warnings:
@@ -1024,6 +1033,11 @@ recent warnings:
 It reads only the trace, so it also works on a machine where the daemon is not
 running, on a trace copied from another box, and — the case it is really for — after
 a power cut, when the trace is the only witness left.
+
+That last case is why the leading temperature names itself. `now 71C (4s ago)` is a
+live machine; once the newest sample is more than a minute old the word changes to
+`last 71C (3h04m ago)`, so a reading taken from a trace that stopped hours ago cannot
+be mistaken for the temperature right now.
 
 ---
 

@@ -1124,6 +1124,61 @@ then fail "no RESULT line ever mentions poweroff" "found one"
 else pass "no RESULT line ever mentions poweroff"; fi
 
 # ============================================================================
+group "9b. contrib tools — the newest sample, and how old it is"
+# ============================================================================
+# Both reporting scripts print the most recent temperature in the trace. That
+# figure is misleading without its age: a trace that stopped hours ago still has
+# a newest sample, and that is the normal state in the case these tools exist for
+# — a machine read after it went down. So the wording is asserted for a fresh
+# trace and a stale one, and for a machine whose date(1) cannot compute the gap
+# at all. Synthetic traces throughout: no daemon, no sensor, no root.
+if ! date -d "@0" '+%Y-%m-%dT%H:%M:%S%:z' >/dev/null 2>&1; then
+  skip "contrib tools report the newest sample and its age" \
+       "building the fixture needs GNU date -d, which this machine does not have"
+else
+  mktrace() {          # mktrace FILE SECONDS_AGO LAST_TEMP
+    local f=$1 endago=$2 last=$3 s e n
+    n=$(date +%s); e=$(( n - endago ))
+    printf '# %s RESULT v=1 mode=ladder budget_w=11.5 tiers=80:11.5,85:7 clamp_w=-\n' \
+      "$(date -d "@$(( e - 120 ))" '+%Y-%m-%dT%H:%M:%S%:z')" > "$f"
+    for (( s = e - 120; s < e; s += 2 )); do
+      printf '%s,67,0\n' "$(date -d "@$s" '+%Y-%m-%dT%H:%M:%S%:z')" >> "$f"
+    done
+    printf '%s,%s,0\n' "$(date -d "@$e" '+%Y-%m-%dT%H:%M:%S%:z')" "$last" >> "$f"
+  }
+
+  FRESH="$WORK/trace-fresh.log"; mktrace "$FRESH" 4     71
+  STALE="$WORK/trace-stale.log"; mktrace "$STALE" 11040 66     # stopped 3h04m back
+
+  out=$("$ROOT/contrib/thermal-summary.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "thermal-summary prints the newest temperature"        "$out" "temps  : now 71C ("
+  assert_contains "thermal-summary prints how old that reading is"       "$out" "ago)"
+
+  out=$("$ROOT/contrib/thermal-clamps.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "thermal-clamps prints the newest temperature"         "$out" "latest       : 71C   (last sample, "
+
+  # The word carries the claim: on a trace that stopped hours ago, nothing may
+  # call itself "now". This is the assertion that matters after a power cut.
+  out=$("$ROOT/contrib/thermal-summary.sh" 24 -f "$STALE" 2>&1)
+  assert_contains     "a stale trace is reported as 'last', not 'now'"   "$out" "temps  : last 66C ("
+  assert_not_contains "a stale trace never calls its newest sample 'now'" "$out" "temps  : now"
+
+  # No date -d: print the absolute clock time rather than invent an interval.
+  NODATE="$WORK/nodate"; mkdir -p "$NODATE"
+  REALDATE=$(command -v date)
+  cat > "$NODATE/date" <<EOF
+#!/bin/sh
+# Test stub: a date(1) with no -d support, as on a busybox userland.
+case "\$1" in -d) exit 1 ;; esac
+exec "$REALDATE" "\$@"
+EOF
+  chmod +x "$NODATE/date"
+  out=$(PATH="$NODATE:$PATH" "$ROOT/contrib/thermal-summary.sh" 1 -f "$FRESH" 2>&1)
+  assert_contains "without date -d, thermal-summary prints a clock time not a guess" \
+                  "$out" "temps  : last 71C (at "
+fi
+
+# ============================================================================
 group "10. hermeticity — the whole suite, end to end"
 # ============================================================================
 if [[ -e "$NETMARK" ]]; then

@@ -125,7 +125,26 @@ for d in /sys/class/powercap/intel-rapl:*; do
   break
 done
 
-awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
+# How old the newest sample is. Reported next to the temperature it belongs to,
+# because "latest" says nothing about currency on its own: a trace that stopped
+# three hours ago still has a latest sample. Computed here rather than in awk —
+# mawk has no mktime, and the seconds-of-day trick below is only exact for gaps
+# under twelve hours, which a window measured in days is not. `date -d` is already
+# a hard requirement of this script; the absolute clock time is the fallback if
+# the timestamp itself will not parse.
+AGE_S=-1; AGE_ABS=""
+last_line=$(grep -v '^#' "$T" | awk -F, 'NF==3' | tail -1)
+if [[ -n "$last_line" ]]; then
+  last_ts=${last_line%%,*}
+  AGE_ABS=${last_ts:11:8}
+  if now_s=$(date +%s 2>/dev/null) && then_s=$(date -d "$last_ts" +%s 2>/dev/null); then
+    AGE_S=$(( now_s - then_s ))
+    (( AGE_S < 0 )) && AGE_S=0        # clock skew, or a trace written in the future
+  fi
+fi
+
+awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" \
+       -v age_s="$AGE_S" -v age_abs="$AGE_ABS" '
   function fmt(s,   h, m) {
     if (s < 60)   return sprintf("%ds", s)
     if (s < 3600) { m = int(s/60); return sprintf("%dm%02ds", m, s-m*60) }
@@ -184,7 +203,7 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
     t = $2 + 0; c = $3 + 0; a = absec($1)
     n++
     if (n == 1) { first = a; tmin = t; tmax = t }
-    last = a; lastt = $1
+    last = a; lastt = $1; t_last = t
     sum += t
     if (t < tmin) tmin = t
     if (t > tmax) tmax = t
@@ -240,6 +259,8 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
     }
 
     printf "\ntemperature\n"
+    printf "  latest       : %.0fC   (last sample, %s)\n", t_last,
+           (age_s >= 0 ? fmt(age_s) " ago" : "at " age_abs)
     printf "  min %.0fC   mean %.1fC   max %.0fC\n", tmin, sum/n, tmax
     printf "  at or above %dC : %s (%.1f%%)\n", warn, fmt(nwarn*step), 100*nwarn/n
     printf "  at or above %dC : %s (%.1f%%)\n", crit, fmt(ncrit*step), 100*ncrit/n
