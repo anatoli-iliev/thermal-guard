@@ -5,10 +5,19 @@
 # SPDX-FileCopyrightText: 2026 Anatoli Iliev
 # SPDX-License-Identifier: MIT
 #
-# usage: thermal-clamps.sh [trace-file] [hours] [warn_c] [crit_c]
-#        thermal-clamps.sh                     # last hour of the default trace
-#        thermal-clamps.sh "" 6                # last six hours
-#        thermal-clamps.sh "" 1 85 88          # thresholds matching your config
+# usage: thermal-clamps.sh [HOURS] [options]
+#
+#        thermal-clamps.sh              # the last hour
+#        thermal-clamps.sh 6            # the last six hours
+#        thermal-clamps.sh 0.25         # the last fifteen minutes
+#        thermal-clamps.sh 6 -f old.log # a trace copied from somewhere else
+#        thermal-clamps.sh 1 -w 85 -c 88
+#
+# The window is the thing you change; the trace almost never is. So HOURS is the
+# first positional and the file moved behind -f. The old "[file] [hours]" order
+# still parses — a positional that looks like a number is a duration and one that
+# does not is a path — because scripts and shell history from before this change
+# should not break.
 #
 # A "clamp episode" is an unbroken run of samples with the clamped flag set —
 # i.e. one continuous stretch during which the guard held the CPU above its
@@ -22,14 +31,70 @@
 
 set -uo pipefail
 
-T=${1:-/var/log/thermal-trace.log}
-[[ -z "$T" ]] && T=/var/log/thermal-trace.log
-HOURS=${2:-1}
-WARN_C=${3:-80}
-CRIT_C=${4:-85}
+PROG=${0##*/}
+T=""; HOURS=""; WARN_C=""; CRIT_C=""
 
-[[ -r "$T" ]] || { echo "thermal-clamps: cannot read $T" >&2; exit 1; }
-case "$HOURS" in ''|*[!0-9.]*) echo "thermal-clamps: hours must be a number (got '$HOURS')" >&2; exit 2 ;; esac
+usage() {
+  cat <<EOF
+usage: $PROG [HOURS] [-f FILE] [-w WARN_C] [-c CRIT_C]
+
+  HOURS        how far back to look, decimals allowed (default 1)
+  -f, --file   trace to read (default /var/log/thermal-trace.log)
+  -w, --warn   first temperature of interest    (default 80)
+  -c, --crit   second temperature of interest   (default 85)
+  -h, --help   this
+
+  $PROG 6            the last six hours
+  $PROG 0.25         the last fifteen minutes
+  $PROG 24 -f /mnt/rescued-trace.log
+EOF
+}
+
+is_num() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+
+while (( $# )); do
+  case "$1" in
+    -f|--file) [[ $# -ge 2 ]] || { echo "$PROG: $1 needs a value" >&2; exit 2; }; T=$2;      shift 2 ;;
+    -w|--warn) [[ $# -ge 2 ]] || { echo "$PROG: $1 needs a value" >&2; exit 2; }; WARN_C=$2; shift 2 ;;
+    -c|--crit) [[ $# -ge 2 ]] || { echo "$PROG: $1 needs a value" >&2; exit 2; }; CRIT_C=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; break ;;
+    -*)        echo "$PROG: unknown option $1 (try --help)" >&2; exit 2 ;;
+    *)
+      # Positionals in the legacy order were [file] [hours] [warn] [crit]. A
+      # number is therefore a duration first, then a warn, then a crit; anything
+      # else — including the empty string the old form needed as a placeholder —
+      # is the file.
+      if is_num "$1"; then
+        if   [[ -z "$HOURS"  ]]; then HOURS=$1
+        elif [[ -z "$WARN_C" ]]; then WARN_C=$1
+        elif [[ -z "$CRIT_C" ]]; then CRIT_C=$1
+        else echo "$PROG: too many numeric arguments (try --help)" >&2; exit 2; fi
+      else
+        [[ -n "$T" ]] && { echo "$PROG: more than one trace given (try --help)" >&2; exit 2; }
+        T=$1
+      fi
+      shift ;;
+  esac
+done
+
+T=${T:-/var/log/thermal-trace.log}
+[[ -z "$T" ]] && T=/var/log/thermal-trace.log
+HOURS=${HOURS:-1}
+WARN_C=${WARN_C:-80}
+CRIT_C=${CRIT_C:-85}
+
+if [[ ! -r "$T" ]]; then
+  echo "$PROG: cannot read $T" >&2
+  # "6h" and "30m" are the obvious things to type, and land here as a filename.
+  # Say so rather than leaving someone staring at a path they never typed.
+  [[ "$T" =~ ^[0-9.]+[A-Za-z]+$ ]] && echo "$PROG: for a duration, give a bare number of hours: $PROG ${T%%[A-Za-z]*}" >&2
+  exit 1
+fi
+is_num "$HOURS" || { echo "$PROG: hours must be a number (got '$HOURS')" >&2; exit 2; }
+for v in "$WARN_C" "$CRIT_C"; do
+  is_num "$v" || { echo "$PROG: temperature thresholds must be numbers (got '$v')" >&2; exit 2; }
+done
 
 # Window selection by timestamp rather than by sample count, so a gap — the
 # daemon stopped, the machine asleep — does not silently widen the window into
@@ -40,9 +105,9 @@ case "$HOURS" in ''|*[!0-9.]*) echo "thermal-clamps: hours must be a number (got
 # date accepts, and a fractional window is exactly what you want when chasing a
 # clamp that just happened.
 SECS=$(awk -v h="$HOURS" 'BEGIN{printf "%d", h*3600}')
-(( SECS > 0 )) || { echo "thermal-clamps: hours must be greater than zero (got '$HOURS')" >&2; exit 2; }
+(( SECS > 0 )) || { echo "$PROG: hours must be greater than zero (got '$HOURS')" >&2; exit 2; }
 CUTOFF=$(date -d "$SECS seconds ago" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null) \
-  || { echo "thermal-clamps: date(1) does not support -d; GNU coreutils is required" >&2; exit 1; }
+  || { echo "$PROG: date(1) does not support -d; GNU coreutils is required" >&2; exit 1; }
 
 printf '== thermal-guard: last %sh of %s ==\n' "$HOURS" "$T"
 printf 'window : since %s\n' "${CUTOFF/T/ }"
