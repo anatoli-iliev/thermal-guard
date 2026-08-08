@@ -1244,15 +1244,24 @@ group "9e. ADAPTIVE_CLAMP_MAX_W — a hard ceiling on the engine clamp"
 # usable. Ambient 5C is used because the uncapped clamp there is 9W, well clear
 # of the 6W ceiling under test.
 CAPBASE=('ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' 'CRIT_C=88' 'TIER_HYSTERESIS=7')
-CAPOFF="$WORK/capoff.conf"; mkconf "$CAPOFF" "${CAPBASE[@]}"
+# Explicitly empty, not merely absent: absent now means the 9W default, and a
+# fixture that silently inherited it would stop testing the no-ceiling path.
+CAPOFF="$WORK/capoff.conf"; mkconf "$CAPOFF" "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W='
 CAP6="$WORK/cap6.conf";     mkconf "$CAP6"   "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W=6'
 CAPHIGH="$WORK/caphigh.conf"; mkconf "$CAPHIGH" "${CAPBASE[@]}" 'ADAPTIVE_CLAMP_MAX_W=20'
+CAPDEF="$WORK/capdef.conf"; mkconf "$CAPDEF" "${CAPBASE[@]}"
 
 assert_eq "no ceiling set leaves the ground-truth ladder untouched" \
           "80:11,85:7" "$(rfield tiers <<<"$(sim "$CAPOFF" ambient=25)")"
 
+# The default is 9W, and -5C is where that bites: uncapped the clamp would be
+# 10.5W there. Asserting both halves, so neither the default nor the way to turn
+# it off can regress unnoticed.
+assert_eq "with no key at all the ceiling defaults to 9W"       9      "$(rfield clamp_w <<<"$(sim "$CAPDEF" ambient=-5)")"
+assert_eq "an explicitly empty value means no ceiling at all"   10.5   "$(rfield clamp_w <<<"$(sim "$CAPOFF" ambient=-5)")"
+
 base5=$(rfield clamp_w <<<"$(sim "$CAPOFF" ambient=5)")
-assert_eq "at 5C the uncapped clamp is 9W (the premise of the tests below)" 9 "$base5"
+assert_eq "at 5C the unceilinged clamp is 9W (the premise of the tests below)" 9 "$base5"
 assert_eq "a 6W ceiling caps the ladder top rung"    6 "$(rfield clamp_w <<<"$(sim "$CAP6" ambient=5)")"
 assert_eq "a ceiling above the derived clamp changes nothing" \
           "$base5" "$(rfield clamp_w <<<"$(sim "$CAPHIGH" ambient=5)")"

@@ -472,8 +472,14 @@
 # settle limit next to the request so you can see how much of it landed.
 #ADAPTIVE_BUDGET_OFFSET_W=0
 
-# A hard ceiling on the emergency clamp the engine derives. Empty means no
-# ceiling, which is the behaviour every version before this one had.
+# A hard ceiling on the emergency clamp the engine derives. Defaults to 9 W. Set
+# it EMPTY for no ceiling, which is what every version before this one did.
+#
+# 9 is sized for a ~17 W-class laptop, the machine this project was measured on.
+# On a larger part it will sit below BUDGET_MIN_W (which defaults to 25% of the
+# stock limit — 31 W on a 125 W CPU), and the floor outranks it, so the effective
+# behaviour there is the floor plus a warning naming the conflict. If your machine
+# is not a small laptop, either raise this to something proportionate or empty it.
 #
 # The clamp is a fraction of the working budget, and that budget rises as it gets
 # colder — so the clamp rises too. On the reference machine it is 7.5W at 20C

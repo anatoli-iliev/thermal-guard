@@ -81,9 +81,11 @@ ADAPTIVE_CLAMP_OFFSET_W=0  # watts added to the emergency clamp the engine deriv
 ADAPTIVE_BUDGET_OFFSET_W=0 # watts added to the working budget — the rung between the
                            # first and the emergency rung. Ladder plans only, and never
                            # past the point where the die would settle on the top rung.
-ADAPTIVE_CLAMP_MAX_W=""    # hard ceiling on the emergency clamp the engine derives, in
-                           # both plan shapes. Empty = no ceiling. Bounds the engine, not
-                           # an explicit TIERS/CLAMP_WATTS, exactly like BUDGET_MAX_W.
+ADAPTIVE_CLAMP_MAX_W=9     # hard ceiling on the emergency clamp the engine derives, in
+                           # both plan shapes. Set empty for no ceiling. Bounds the engine,
+                           # not an explicit TIERS/CLAMP_WATTS, exactly like BUDGET_MAX_W.
+                           # 9 suits a ~17W-class laptop; on a larger part it will sit
+                           # under BUDGET_MIN_W, which outranks it and says so.
 LADDER_MIN_WINDOW_C=8      # burst window below the first rung before a ladder beats a flat cap
 LADDER_IDLE_RISE_C=""      # die rise above ambient at light load. Empty = 0.45 x Rtheta x stock
 WEATHER_URL=""             # empty = the built-in Open-Meteo endpoint
