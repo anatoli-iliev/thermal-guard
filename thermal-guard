@@ -75,6 +75,9 @@ BUDGET_STEP_W=0.5          # quantisation, always rounded DOWN; also acts as the
 LADDER_START_MARGIN_C=3    # first rung sits this far below DIE_TARGET_C
 LADDER_TOP_MARGIN_C=3      # top (emergency) rung sits this far below CRIT_C
 LADDER_TOP_FACTOR=0.65     # top-rung watts as a fraction of the working budget
+ADAPTIVE_CLAMP_OFFSET_W=0  # watts added to the emergency clamp the engine derives.
+                           # 0 = the engine's own number. Never raises the clamp past
+                           # the point where it could no longer release.
 LADDER_MIN_WINDOW_C=8      # burst window below the first rung before a ladder beats a flat cap
 LADDER_IDLE_RISE_C=""      # die rise above ambient at light load. Empty = 0.45 x Rtheta x stock
 WEATHER_URL=""             # empty = the built-in Open-Meteo endpoint
@@ -246,6 +249,8 @@ is_int "$LADDER_TOP_MARGIN_C" && (( LADDER_TOP_MARGIN_C >= 1 )) \
   || die "LADDER_TOP_MARGIN_C must be an integer >= 1 (got '$LADDER_TOP_MARGIN_C')"
 is_num "$LADDER_TOP_FACTOR" && awk -v x="$LADDER_TOP_FACTOR" 'BEGIN{exit !(x>0 && x<=1)}' \
   || die "LADDER_TOP_FACTOR must be greater than 0 and at most 1 (got '$LADDER_TOP_FACTOR')"
+is_num "$ADAPTIVE_CLAMP_OFFSET_W" \
+  || die "ADAPTIVE_CLAMP_OFFSET_W must be a number >= 0 (got '$ADAPTIVE_CLAMP_OFFSET_W')"
 is_num "$LADDER_MIN_WINDOW_C" \
   || die "LADDER_MIN_WINDOW_C must be a number >= 0 (got '$LADDER_MIN_WINDOW_C')"
 [[ -z "$LADDER_IDLE_RISE_C" ]] || is_num "$LADDER_IDLE_RISE_C" \
@@ -1220,7 +1225,8 @@ plan_compute() {
             -v bmax="$BUDGET_MAX_W" -v idlerise="$LADDER_IDLE_RISE_C" \
             -v rung1="$RUNG1_T" -v rungtop="$RUNGTOP_T" -v minwin="$LADDER_MIN_WINDOW_C" \
             -v amode="$ADAPTIVE_MODE" -v curmode="$PLAN_MODE_ACTIVE" \
-            -v topf="$LADDER_TOP_FACTOR" -v hyst="$TIER_HYSTERESIS_CFG" 'BEGIN{
+            -v topf="$LADDER_TOP_FACTOR" -v hyst="$TIER_HYSTERESIS_CFG" \
+            -v clampoff="$ADAPTIVE_CLAMP_OFFSET_W" 'BEGIN{
     b = (target - amb) / rth
     if (b < 0) b = 0
     # The 1e-9 is required, not defensive: a value that is exactly 11.0 can be
@@ -1249,7 +1255,12 @@ plan_compute() {
 
     wtop = 0; rej = "-"; floored = 0
     if (mode == "ladder") {
-      wp = topf * b
+      # ADAPTIVE_CLAMP_OFFSET_W is added here, INSIDE the min() below, and that
+      # placement is the whole safety argument: the offset asks for a more
+      # generous emergency rung, and wr refuses whatever part of the request the
+      # physics will not carry. On a cold day the full offset lands; on a hot one
+      # it is trimmed to what can still release. It is a request, not a floor.
+      wp = topf * b + clampoff
       # The release budget. This is the fix for the measured failure: a rung
       # whose own settling temperature sits above its release point can never
       # let go, and stays engaged for as long as the load lasts.
@@ -1274,7 +1285,14 @@ plan_compute() {
       else if (amb + rth * b   >= rungtop)       rej = "settle"
       if (rej != "-") { mode = "constant"; why = "ladder-cannot-release"; wtop = 0 }
     }
-    cl = b * 0.7; if (cl < 1) cl = 1
+    # The constant-cap shape derives an emergency clamp too, and the same knob
+    # governs it: "the clamp" means the same thing to a reader in either mode.
+    # Bounded by the working budget, because a clamp at or above the cap it is
+    # supposed to fall back from is not a clamp at all.
+    # (No apostrophes in this block: it lives inside a single-quoted awk program.)
+    cl = b * 0.7 + clampoff
+    if (cl > b) cl = b
+    if (cl < 1) cl = 1
     printf "%g %s %.1f %.1f %s %s %g %.2f %s %.1f\n", \
       b, bsrc, idle, win, mode, why, wtop, cl, rej, amb + rth * b
   }')
@@ -1724,6 +1742,9 @@ print_adaptive() {
   printf "$f" 'sustainable budget' "${PROP_BUDGET}W  ($PROP_BUDGET_SRC)"
   printf "$f" 'light-load floor' "$(printf '%sC  (ambient + %.1fC idle rise, %s)' "$PLAN_IDLE" "$LADDER_IDLE_RISE_C" "$IDLE_RISE_SRC")"
   printf "$f" 'burst window' "${PLAN_WINDOW}C  (first rung ${RUNG1_T}C minus floor ${PLAN_IDLE}C), needs ${WINDOW_MIN_OUT}C"
+  if awk -v x="$ADAPTIVE_CLAMP_OFFSET_W" 'BEGIN{exit !(x>0)}'; then
+    printf "$f" 'clamp offset' "+${ADAPTIVE_CLAMP_OFFSET_W}W asked for on the emergency clamp (trimmed to what can still release)"
+  fi
   printf "$f" mode "${PROP_MODE^^}"
   print_plan_reason "$f" '                       '
   if plan_pinned; then
@@ -1903,6 +1924,9 @@ print_simulate() {   # $1 = <outdoor C> | ambient=<c> | unknown
   printf "$f" 'sustainable budget' "$(awk -v t="$DIE_TARGET_C" -v a="$AMBIENT_VAL" -v r="$RTHETA" 'BEGIN{printf "%.3f", (t-a)/r}')W -> ${PROP_BUDGET}W applied   (floor ${BUDGET_MIN_W}W, ceiling ${BUDGET_MAX_W}W)"
   printf "$f" 'light-load die floor' "${PLAN_IDLE}C     (ambient + $(printf '%.1f' "$LADDER_IDLE_RISE_C")C idle rise)"
   printf "$f" 'first rung would be' "${RUNG1_T}C       -> burst window ${PLAN_WINDOW}C, needs ${WINDOW_MIN_OUT}C"
+  if awk -v x="$ADAPTIVE_CLAMP_OFFSET_W" 'BEGIN{exit !(x>0)}'; then
+    printf "$f" 'clamp offset' "+${ADAPTIVE_CLAMP_OFFSET_W}W asked for   (release budget here is $(awk -v r1="$RUNG1_T" -v h="$TIER_HYSTERESIS_CFG" -v a="$AMBIENT_VAL" -v r="$RTHETA" 'BEGIN{printf "%.2f", (r1-h-a)/r}')W — the offset is trimmed to fit under it)"
+  fi
   if (( unbuildable )); then
     printf "$f" decision 'NO USABLE PLAN — would not cap power'
   elif [[ "$PROP_MODE" == ladder ]]; then

@@ -1124,6 +1124,61 @@ then fail "no RESULT line ever mentions poweroff" "found one"
 else pass "no RESULT line ever mentions poweroff"; fi
 
 # ============================================================================
+group "9c. ADAPTIVE_CLAMP_OFFSET_W — a more generous emergency clamp"
+# ============================================================================
+# The engine derives the emergency clamp as LADDER_TOP_FACTOR x budget, and this
+# key adds watts to that. It is applied INSIDE the release bound, so what it
+# cannot do is as important as what it can: it must never buy a rung that the
+# machine cannot cool back out of, and it must never silently change the shape
+# of the plan. Both are asserted here, alongside the arithmetic.
+OFF0="$WORK/off0.conf"; mkconf "$OFF0" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=0'
+OFF1="$WORK/off1.conf"; mkconf "$OFF1" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=1'
+OFFBIG="$WORK/offbig.conf"; mkconf "$OFFBIG" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                       'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_CLAMP_OFFSET_W=99'
+
+# Default is zero, and zero is not a new code path: it must reproduce the
+# ground-truth ladder byte for byte.
+out=$(sim "$OFF0" ambient=25)
+assert_eq "offset 0 leaves the ground-truth ladder untouched" \
+          "80:11,85:7" "$(rfield tiers <<<"$out")"
+
+out=$(sim "$OFF1" ambient=25)
+assert_eq "offset +1W raises the emergency rung 7W -> 8W"  "80:11,85:8" "$(rfield tiers <<<"$out")"
+assert_eq "offset +1W reports the raised clamp in clamp_w" "8"          "$(rfield clamp_w <<<"$out")"
+assert_eq "offset +1W leaves the working rung alone"       "11"         "$(rfield budget_w <<<"$out")"
+assert_eq "offset +1W does not change the plan shape"      ladder       "$(rfield mode <<<"$out")"
+assert_eq "offset +1W does not change the plan reason"     window-ok    "$(rfield reason <<<"$out")"
+
+# The safety property. 99W cannot be honoured: the rung would settle the die
+# above its own release point and could never let go — the measured failure the
+# release bound exists to prevent. It must be trimmed, not obeyed, and the
+# ladder must survive rather than collapsing to a constant cap.
+out=$(sim "$OFFBIG" ambient=25)
+assert_eq "an impossible offset still yields a ladder, not a collapse" ladder "$(rfield mode <<<"$out")"
+big_clamp=$(rfield clamp_w <<<"$out")
+# release budget = (first rung 80C - hysteresis 7C - ambient 25C) / Rtheta 5.24
+assert_le "the trimmed rung stays within the release budget (9.16W)" "$big_clamp" 9.16
+settle=$(awk -v w="$big_clamp" 'BEGIN{printf "%.2f", 25 + 5.24*w}')
+assert_le "the trimmed rung still cools back below its release point (73C)" "$settle" 73
+
+# A constant-cap plan derives a clamp too, and the same key governs it.
+outc=$(sim "$OFF0" ambient=40); outo=$(sim "$OFF1" ambient=40)
+if [[ "$(rfield mode <<<"$outc")" == constant ]]; then
+  d=$(awk -v a="$(rfield clamp_w <<<"$outc")" -v b="$(rfield clamp_w <<<"$outo")" 'BEGIN{printf "%.2f", b-a}')
+  assert_eq "the offset reaches the constant-cap clamp as well" "1.00" "$d"
+else
+  skip "the offset reaches the constant-cap clamp as well" "no constant plan at 40C on this fixture"
+fi
+
+BADOFF="$WORK/badoff.conf"; mkconf "$BADOFF" 'ADAPTIVE=yes' 'ADAPTIVE_CLAMP_OFFSET_W=abc'
+out=$(sim "$BADOFF" ambient=25); rc=$(lastrc)
+if (( rc != 0 )) && [[ "$out" == *ADAPTIVE_CLAMP_OFFSET_W* ]]
+then pass "a non-numeric offset is refused by name"
+else fail "a non-numeric offset is refused by name" "rc=$rc out=[$out]"; fi
+
+# ============================================================================
 group "9b. contrib tools — the newest sample, and how old it is"
 # ============================================================================
 # Both reporting scripts print the most recent temperature in the trace. That

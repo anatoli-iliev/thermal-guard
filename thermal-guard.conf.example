@@ -416,6 +416,30 @@
 # that made a clamp stick for 11 minutes in the field.
 #LADDER_TOP_FACTOR=0.65
 
+# Watts added to the emergency clamp the engine derives — the ladder's top rung,
+# or the clamp in a constant-cap plan. For when the engine's own number is more
+# conservative than your machine needs, and you want it moved without giving up
+# the adaptive plan: setting TIERS or CLAMP_WATTS to a fixed figure pins the whole
+# plan (mode=static) and the weather stops being consulted at all, which is a much
+# bigger change than "one watt more at the top".
+#
+# Whereas LADDER_TOP_FACTOR is a fraction and so moves with the budget, this is a
+# flat addition, and the difference matters on a cold day: raising the factor to
+# get +1 W at 20C hands you +2 W at 0C, where the budget is larger. This does not.
+#
+# It is a REQUEST, not a floor. The addition is made before the release bound,
+# never after, so it can only ever buy a rung the machine can still cool back out
+# of. Ask for +99 W and you will get whatever is left under that bound — the rung
+# that settles the die below its own release temperature — because a rung that
+# cannot let go stays engaged for as long as the load lasts, which is the measured
+# failure the bound exists to prevent. --detect and --simulate print the release
+# budget next to the request so you can see how much of it actually landed.
+#
+# Direction of travel: this makes the guard LESS protective at the temperature
+# where it is already intervening. On the reference machine +1 W moves the 85C
+# rung from 7.5 W to 8.5 W at 19.5C ambient.
+#ADAPTIVE_CLAMP_OFFSET_W=0
+
 # The ladder-versus-constant test, in one number.
 #
 # A ladder only pays for itself while the die at LIGHT load sits well below the
