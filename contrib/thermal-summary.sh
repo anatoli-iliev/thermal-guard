@@ -33,6 +33,16 @@ else
   printf 'active : no RESULT line — adaptive is off, or this trace predates 1.2.0\n'
 fi
 
+# Labelled as this machine, never merged with the trace-derived numbers: reading a
+# trace copied from another box is a supported use.
+for d in /sys/class/powercap/intel-rapl:*; do
+  [[ -r "$d/name" && -r "$d/constraint_0_power_limit_uw" ]] || continue
+  [[ "$(<"$d/name")" == package-0 ]] || continue
+  printf 'power  : %sW applied right now (live RAPL on THIS machine)\n' \
+    "$(awk -v u="$(<"$d/constraint_0_power_limit_uw")" 'BEGIN{printf "%.1f", u/1000000}')"
+  break
+done
+
 grep -v '^#' "$T" | awk -F, 'NF==3' | tail -"$SAMPLES" |
   awk -F, '
     { n++; c += $3; t = $2 + 0; s += t
