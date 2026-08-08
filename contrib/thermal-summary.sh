@@ -4,7 +4,15 @@
 # SPDX-FileCopyrightText: 2026 Anatoli Iliev
 # SPDX-License-Identifier: MIT
 #
-# usage: thermal-summary.sh [trace-file] [hours]
+# usage: thermal-summary.sh [HOURS] [-f FILE]
+#
+#        thermal-summary.sh              # the last 24 hours
+#        thermal-summary.sh 1            # the last hour
+#        thermal-summary.sh 24 -f /mnt/rescued-trace.log
+#
+# Same argument shape as thermal-clamps.sh: the window is what you change, so it
+# is the first positional and the file lives behind -f. The old "[file] [hours]"
+# order still parses.
 #
 # Reads only the trace, so it works on a machine where the daemon is not running,
 # on a copy of a trace taken from somewhere else, and — the case it is really for
@@ -15,14 +23,54 @@
 
 set -uo pipefail
 
-T=${1:-/var/log/thermal-trace.log}
-HOURS=${2:-24}
+PROG=${0##*/}
+T=""; HOURS=""
 
-[[ -r "$T" ]] || { echo "thermal-summary: cannot read $T" >&2; exit 1; }
+usage() {
+  cat <<EOF
+usage: $PROG [HOURS] [-f FILE]
+
+  HOURS        how far back to look, decimals allowed (default 24)
+  -f, --file   trace to read (default /var/log/thermal-trace.log)
+  -h, --help   this
+EOF
+}
+
+is_num() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+
+while (( $# )); do
+  case "$1" in
+    -f|--file) [[ $# -ge 2 ]] || { echo "$PROG: $1 needs a value" >&2; exit 2; }; T=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; break ;;
+    -*)        echo "$PROG: unknown option $1 (try --help)" >&2; exit 2 ;;
+    *)
+      if is_num "$1"; then
+        [[ -z "$HOURS" ]] || { echo "$PROG: more than one duration given (try --help)" >&2; exit 2; }
+        HOURS=$1
+      else
+        [[ -z "$T" ]] || { echo "$PROG: more than one trace given (try --help)" >&2; exit 2; }
+        T=$1
+      fi
+      shift ;;
+  esac
+done
+
+T=${T:-/var/log/thermal-trace.log}
+HOURS=${HOURS:-24}
+
+if [[ ! -r "$T" ]]; then
+  echo "$PROG: cannot read $T" >&2
+  [[ "$T" =~ ^[0-9.]+[A-Za-z]+$ ]] && echo "$PROG: for a duration, give a bare number of hours: $PROG ${T%%[A-Za-z]*}" >&2
+  exit 1
+fi
+is_num "$HOURS" || { echo "$PROG: hours must be a number (got '$HOURS')" >&2; exit 2; }
 
 # 2 s is the default POLL_SEC. If yours differs the window is scaled wrong, which
-# is why the sample count is printed rather than assumed.
-SAMPLES=$(( HOURS * 1800 ))
+# is why the sample count is printed rather than assumed. Computed in awk because
+# bash arithmetic is integer-only and fractional windows are useful.
+SAMPLES=$(awk -v h="$HOURS" 'BEGIN{printf "%d", h*1800}')
+(( SAMPLES > 0 )) || { echo "$PROG: hours must be greater than zero (got '$HOURS')" >&2; exit 2; }
 
 printf '== thermal-guard: last %sh of %s ==\n' "$HOURS" "$T"
 
