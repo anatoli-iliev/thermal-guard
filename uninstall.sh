@@ -30,6 +30,11 @@ STATE_DIR=/var/lib/thermal-guard
 STOCK_FILE="$STATE_DIR/stock-power-limit-uw"
 TURBO_FILE="$STATE_DIR/stock-no-turbo"
 PERF_FILE="$STATE_DIR/stock-max-perf-pct"
+# Written only when ADAPTIVE=yes. LOCATION_FILE is mode 0600 because a
+# latitude and longitude is effectively a home address — leaving it behind on a
+# machine being handed on, or in a backup, is the one thing --purge must not do.
+WEATHER_FILE="$STATE_DIR/weather"
+LOCATION_FILE="$STATE_DIR/location"
 PSTATE=/sys/devices/system/cpu/intel_pstate
 # Read the trace path out of the config WITHOUT sourcing it. Sourcing would run
 # arbitrary code from a file we are about to delete, and shellcheck cannot follow
@@ -104,10 +109,21 @@ for f in "$UNIT" "$BIN"; do
 done
 [[ -d /run/systemd/system ]] && systemctl daemon-reload
 if (( PURGE )); then
-  for f in "$CONF" "$STOCK_FILE" "$TURBO_FILE" "$PERF_FILE" "$TRACE" "$TRACE.1"; do
+  for f in "$CONF" "$STOCK_FILE" "$TURBO_FILE" "$PERF_FILE" \
+           "$WEATHER_FILE" "$LOCATION_FILE" "$TRACE" "$TRACE.1"; do
     [[ -e "$f" ]] && { rm -f "$f"; echo "   removed $f"; }
   done
-  rmdir "$STATE_DIR" 2>/dev/null
+  # Loud rather than silent: a 2>/dev/null rmdir is how the last file added to
+  # this directory came to survive --purge without anyone noticing.
+  if [[ -d "$STATE_DIR" ]]; then
+    if rmdir "$STATE_DIR" 2>/dev/null; then
+      echo "   removed $STATE_DIR"
+    else
+      echo "   NOT removed: $STATE_DIR still contains files this uninstaller does not know about:"
+      ls -A "$STATE_DIR" 2>/dev/null | sed 's/^/     /'
+      echo "     check them, then: sudo rm -rf $STATE_DIR"
+    fi
+  fi
 else
   echo "   kept $CONF, the saved state in $STATE_DIR and $TRACE"
   echo "   (use --purge to remove those too)"
