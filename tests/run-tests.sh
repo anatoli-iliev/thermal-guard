@@ -1179,6 +1179,61 @@ then pass "a non-numeric offset is refused by name"
 else fail "a non-numeric offset is refused by name" "rc=$rc out=[$out]"; fi
 
 # ============================================================================
+group "9d. ADAPTIVE_BUDGET_OFFSET_W — a wider band between the rungs"
+# ============================================================================
+# Widens the working rung, the band between the first rung and the emergency one.
+# Its bound is stricter than the clamp offset's: the working rung settles the die
+# by construction, so a budget that settles ON the emergency rung would engage
+# that rung under ordinary load. The engine already rejects such a ladder and
+# falls back to a constant cap — which would cap the machine at every temperature
+# and remove the uncapped band this key exists to protect. So asking for too much
+# must yield less, not collapse. Ambient 21C is used because it has headroom
+# under the settle bound; at 25C the bound is already binding and the correct
+# answer is that nothing moves.
+BOFF0="$WORK/boff0.conf"; mkconf "$BOFF0" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=0'
+BOFF1="$WORK/boff1.conf"; mkconf "$BOFF1" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=1'
+BOFFBIG="$WORK/boffbig.conf"; mkconf "$BOFFBIG" 'ADAPTIVE=yes' 'AMBIENT_C=25' 'RTHETA_C_PER_W=5.24' \
+                                          'CRIT_C=88' 'TIER_HYSTERESIS=7' 'ADAPTIVE_BUDGET_OFFSET_W=99'
+
+assert_eq "budget offset 0 leaves the ground-truth ladder untouched" \
+          "80:11,85:7" "$(rfield tiers <<<"$(sim "$BOFF0" ambient=25)")"
+
+out=$(sim "$BOFF1" ambient=21)
+assert_eq "budget +1W widens the working rung 11.5W -> 12W" "12"     "$(rfield budget_w <<<"$out")"
+assert_eq "budget +1W keeps the plan a ladder"              ladder   "$(rfield mode <<<"$out")"
+assert_contains "budget +1W leaves everything under the first rung uncapped" \
+                "$(sim "$BOFF1" ambient=21)" "baseline stock"
+
+# The settle bound, which is the whole safety story for this key.
+out=$(sim "$BOFFBIG" ambient=21)
+assert_eq "an impossible budget offset still yields a ladder, not a constant cap" \
+          ladder "$(rfield mode <<<"$out")"
+bw=$(rfield budget_w <<<"$out")
+settle=$(awk -v b="$bw" 'BEGIN{printf "%.2f", 21 + 5.24*b}')
+# rungtop = CRIT_C 88 - LADDER_TOP_MARGIN_C 3 = 85C. Strictly under, never equal:
+# the settle rejection tests >=, so landing exactly on it would collapse the plan.
+if awk -v s="$settle" 'BEGIN{exit !(s < 85)}'
+then pass "the widened rung still settles strictly below the 85C rung (${settle}C)"
+else fail "the widened rung still settles strictly below the 85C rung" "settles at ${settle}C"; fi
+
+# Ladder plans only: a constant cap has no band between rungs to widen.
+c0=$(sim "$BOFF0" ambient=40); c1=$(sim "$BOFF1" ambient=40)
+if [[ "$(rfield mode <<<"$c0")" == constant ]]; then
+  assert_eq "a constant-cap plan is left alone by the budget offset" \
+            "$(rfield budget_w <<<"$c0")" "$(rfield budget_w <<<"$c1")"
+else
+  skip "a constant-cap plan is left alone by the budget offset" "no constant plan at 40C on this fixture"
+fi
+
+BADB="$WORK/badboff.conf"; mkconf "$BADB" 'ADAPTIVE=yes' 'ADAPTIVE_BUDGET_OFFSET_W=-3'
+out=$(sim "$BADB" ambient=25); rc=$(lastrc)
+if (( rc != 0 )) && [[ "$out" == *ADAPTIVE_BUDGET_OFFSET_W* ]]
+then pass "a negative budget offset is refused by name"
+else fail "a negative budget offset is refused by name" "rc=$rc out=[$out]"; fi
+
+# ============================================================================
 group "9b. contrib tools — the newest sample, and how old it is"
 # ============================================================================
 # Both reporting scripts print the most recent temperature in the trace. That

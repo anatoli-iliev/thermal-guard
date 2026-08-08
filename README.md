@@ -713,6 +713,7 @@ one costs you.
 | `LADDER_TOP_MARGIN_C` | `3` | Top generated rung sits this far below `CRIT_C`. This is your overshoot margin |
 | `LADDER_TOP_FACTOR` | `0.65` | Top-rung watts as a fraction of the budget, reduced further if the rung could not release |
 | `ADAPTIVE_CLAMP_OFFSET_W` | `0` | Watts added to the engine's emergency clamp, keeping the plan adaptive. Trimmed to whatever the release bound allows, so it is a request rather than a floor |
+| `ADAPTIVE_BUDGET_OFFSET_W` | `0` | Watts added to the working rung — the band between the first and emergency rungs. Ladder plans only, and trimmed to keep the die settling below the emergency rung, since a ladder that cannot hold becomes a constant cap |
 | `LADDER_MIN_WINDOW_C` | `8` | Minimum burst window before a ladder beats a flat cap. ±2 °C of hysteresis around it |
 | `LADDER_IDLE_RISE_C` | `0.45 × Rθ × stock` | Die rise above ambient at light load. Decides the crossover — worth measuring |
 | `WEATHER_URL` | Open-Meteo | `https://` only. Must return a `current` object with a numeric `temperature_2m` |

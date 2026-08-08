@@ -440,6 +440,38 @@
 # rung from 7.5 W to 8.5 W at 19.5C ambient.
 #ADAPTIVE_CLAMP_OFFSET_W=0
 
+# Watts added to the WORKING budget — the rung between the first rung and the
+# emergency one, i.e. the band the machine actually runs in once it has warmed
+# up. Everything below the first rung stays uncapped either way; this key does
+# not touch that.
+#
+# The bound is stricter than the clamp offset's, and for a concrete reason. The
+# working rung settles the die by construction: at budget B and ambient A the die
+# comes to rest at A + Rtheta x B. Push B far enough and that resting point
+# reaches the emergency rung, which then engages under ordinary load rather than
+# in an emergency. The engine already refuses to build such a ladder, and the
+# refusal falls through to a CONSTANT CAP — which caps the machine at every
+# temperature and takes away the uncapped band under the first rung. Asking for
+# more power would end in less of it. So the request is trimmed to keep the
+# settling point under the emergency rung instead of being allowed to collapse.
+#
+# What that means in practice, on the reference machine (Rtheta 5.24, rungs at
+# 80C and 85C), asking for +1 W:
+#
+#   15C outside   12.5W -> 13W     the full watt lands
+#   21C outside   11.5W -> 12W     the full watt lands
+#   23C outside   11W   -> 11.5W   half of it lands, the bound is binding
+#   30C outside   10W   -> 10W     nothing lands, the bound is already tight
+#   35C outside   constant cap     ladder plans only, so nothing changes
+#
+# The watts it does hand you come out of DIE_TARGET_MARGIN_C, which exists to
+# cover package-versus-hottest-core error, die ripple and ambient error. A die
+# that settled at 80.9C will now settle at 83.6C. That is still under the rung,
+# but there is less room for the die to wobble before the clamp fires, so expect
+# more clamp episodes on a marginal day. --detect and --simulate print the
+# settle limit next to the request so you can see how much of it landed.
+#ADAPTIVE_BUDGET_OFFSET_W=0
+
 # The ladder-versus-constant test, in one number.
 #
 # A ladder only pays for itself while the die at LIGHT load sits well below the
