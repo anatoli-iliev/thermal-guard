@@ -85,6 +85,26 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
       if      (match($0, /-> stock/))    applied = "stock"
       else if (match($0, /-> [0-9.]+W/)) applied = substr($0, RSTART+3, RLENGTH-3)
     }
+    # AMBIENT carries two different numbers and they routinely disagree: the raw
+    # reading the weather service returned, and the value the engine actually used
+    # after ageing it toward the conservative fallback. Showing only one of them
+    # makes the budget look arbitrary — 25.5C outside producing a plan sized for
+    # 27.9C reads as a bug until you can see the ageing.
+    if ($0 ~ / AMBIENT /) {
+      ets = substr($0, 3, 19)
+      if (match($0, /AMBIENT -?[0-9.]+C/))   a_used = substr($0, RSTART+8, RLENGTH-9)
+      if (match($0, /\(outdoor -?[0-9.]+C/)) { a_read = substr($0, RSTART+9, RLENGTH-10); a_fb = 0 }
+      else if ($0 ~ /\(fallback\)/)          { a_read = "";                               a_fb = 1 }
+      if (match($0, /age [0-9]+s/))          a_age  = substr($0, RSTART+4, RLENGTH-5)
+      if (ets >= cut) {
+        nwx++
+        if (a_fb) nfb++
+        else if (a_read != "") {
+          if (omin == "" || a_read+0 < omin+0) omin = a_read
+          if (omax == "" || a_read+0 > omax+0) omax = a_read
+        }
+      }
+    }
     if ($0 ~ / RESULT /) {
       if (match($0, /mode=[^ ]+/))    p_mode   = substr($0, RSTART+5,  RLENGTH-5)
       if (match($0, /budget_w=[^ ]+/))p_budget = substr($0, RSTART+9,  RLENGTH-9)
@@ -109,9 +129,9 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
     # An episode ends at the first UNCLAMPED sample, and that timestamp is the
     # end: the clamp was in force for the whole interval it closes. Adding a
     # further sample interval on top would double-count it.
-    if (c && !inrun) { inrun = 1; rs = a; rstart = substr($1, 12, 8); rpeak = t; rw = applied }
+    if (c && !inrun) { inrun = 1; rs = a; rstart = substr($1, 12, 8); rpeak = t; rw = applied; ro = a_read }
     else if (c)      { if (t > rpeak) rpeak = t }
-    else if (inrun)  { inrun = 0; ne++; es[ne] = rs; ee[ne] = a; ep[ne] = rpeak; et[ne] = rstart; ew[ne] = rw }
+    else if (inrun)  { inrun = 0; ne++; es[ne] = rs; ee[ne] = a; ep[ne] = rpeak; et[ne] = rstart; ew[ne] = rw; eo[ne] = ro }
   }
   END {
     if (!n) { print "\nno samples in this window — was the daemon running?"; exit }
@@ -119,7 +139,7 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
     step = (n > 1) ? span / (n - 1) : 2          # observed sample interval
     # An episode still open at the end of the window has no closing sample, so
     # it is credited to the end of the interval its last sample covers.
-    if (inrun) { ne++; es[ne] = rs; ee[ne] = last + step; ep[ne] = rpeak; et[ne] = rstart; ew[ne] = rw; open = 1 }
+    if (inrun) { ne++; es[ne] = rs; ee[ne] = last + step; ep[ne] = rpeak; et[ne] = rstart; ew[ne] = rw; eo[ne] = ro; open = 1 }
 
     printf "samples: %d over %s (%.1fs apart)\n", n, fmt(span + step), step
 
@@ -138,6 +158,22 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
       printf "  ladder steps : none — constant cap, emergency clamp %sW\n", p_clamp
     }
 
+    if (a_read != "" || a_fb) {
+      printf "\noutside\n"
+      if (a_fb)
+        printf "  reading      : none trusted — running on the conservative fallback\n"
+      else
+        printf "  reading      : %sC%s\n", a_read, (a_age != "" ? sprintf("   (%s old when last used)", fmt(a_age+0)) : "")
+      if (a_used != "" && a_read != "" && a_used+0 != a_read+0)
+        printf "  used as      : %sC   (aged toward the conservative fallback, which is what shrinks the budget)\n", a_used
+      else if (a_used != "")
+        printf "  used as      : %sC\n", a_used
+      if (omin != "")
+        printf "  in window    : min %sC  max %sC   (%d update(s), %d fallback(s))\n", omin, omax, nwx+0, nfb+0
+      else if (nwx)
+        printf "  in window    : %d update(s), %d fallback(s)\n", nwx+0, nfb+0
+    }
+
     printf "\ntemperature\n"
     printf "  min %.0fC   mean %.1fC   max %.0fC\n", tmin, sum/n, tmax
     printf "  at or above %dC : %s (%.1f%%)\n", warn, fmt(nwarn*step), 100*nwarn/n
@@ -148,10 +184,11 @@ awk -F, -v cut="$CUTOFF" -v warn="$WARN_C" -v crit="$CRIT_C" -v live="$LIVE_W" '
     tot = 0
     for (i = 1; i <= ne; i++) { d[i] = ee[i] - es[i]; tot += d[i] }
     printf "\nclamp episodes: %d   total %s (%.1f%% of the window)\n", ne, fmt(tot), 100*tot/(span+step)
-    printf "  %-3s %-10s %-9s %-6s %s\n", "#", "started", "lasted", "peak", "held at"
+    printf "  %-3s %-10s %-9s %-6s %-8s %s\n", "#", "started", "lasted", "peak", "held at", "outside"
     for (i = 1; i <= ne; i++)
-      printf "  %-3d %-10s %-9s %-6s %s%s\n", i, et[i], fmt(d[i]), sprintf("%.0fC", ep[i]),
+      printf "  %-3d %-10s %-9s %-6s %-8s %s%s\n", i, et[i], fmt(d[i]), sprintf("%.0fC", ep[i]),
              (ew[i] == "" ? "?" : ew[i]),
+             (eo[i] == "" ? "?" : eo[i] "C"),
              (open && i == ne) ? "   (still clamped)" : ""
 
     longest = d[1]; shortest = d[1]
