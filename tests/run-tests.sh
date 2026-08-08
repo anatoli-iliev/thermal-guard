@@ -13,12 +13,14 @@
 #
 #   * Every physics assertion goes through `--simulate`, which by contract
 #     writes no hardware register and opens no socket.
-#   * The machine's stock power limit is pinned by writing
-#     $THERMAL_GUARD_STATE/stock-power-limit-uw, which is the FIRST source
-#     find_stock_watts consults. That makes the numbers identical on a bare CI
-#     runner and on a developer's laptop that really does have RAPL — without
-#     it, a laptop already capped to 11 W would derive a 11 W ceiling and every
-#     ground-truth number would shift.
+#   * The machine's stock RATING is pinned with $THERMAL_GUARD_ASSUME_STOCK_W,
+#     which overrides detection outright. That makes the numbers identical on a
+#     bare CI runner and on a developer's laptop that really does have RAPL and
+#     publishes a rating of its own. $THERMAL_GUARD_STATE/stock-power-limit-uw is
+#     also written, but only as the snapshot — the thing restored on exit — which
+#     is a different question from the rating and is no longer consulted for
+#     budgets. Getting those two confused is precisely the defect this suite now
+#     regression-tests (section 8c).
 #   * Tjmax is pinned with $THERMAL_GUARD_ASSUME_TJMAX_C, which only fills in a
 #     Tjmax the hardware did not report. On a machine whose coretemp reports a
 #     different Tjmax, the two tests that actually depend on Tjmax report SKIP
@@ -1016,6 +1018,68 @@ assert_contains "--purge removes the location cache, which holds a home address"
   "$unsrc" '"$LOCATION_FILE"'
 assert_contains "--purge reports what it could not remove instead of failing silently" \
   "$unsrc" "still contains files this uninstaller does not know about"
+
+# ============================================================================
+group "8c. RATING vs SNAPSHOT — the stale stock limit defect"
+# ============================================================================
+# Found in production on the reference machine. The daemon used to answer two
+# different questions with one number:
+#
+#   "what is this CPU rated to sustain?"   -> the basis for the budget ceiling,
+#                                             the idle-rise estimate, and the
+#                                             engine's uncapped baseline
+#   "what was in the register before us?"  -> the thing to put back on exit
+#
+# It answered both with a snapshot of the live register taken on the first ever
+# run. On a machine whose first run happened while an earlier experiment had the
+# package capped, that snapshot recorded 11 W as the rating of a 17 W part, and
+# never self-corrected: the ceiling, the idle rise and the ladder's burst
+# headroom were all silently held at 11 W. `--detect` reported it as stock.
+SNAP="$STATE/stock-power-limit-uw"
+printf '%s\n' 11000000 > "$SNAP"      # a stale snapshot, 11 W on a 17 W part
+
+out=$(detect "$REF")
+eff_ceiling=$(sed -n 's/^  budget band *: [^ ]*W \.\. \([^ ]*\)W .*/\1/p' <<<"$out")
+assert_eq "a stale 11W snapshot does not become the ${CEILING}W ceiling" "$CEILING" "$eff_ceiling"
+
+# 0.45 x 5.24 x 17 = 40.1 C of idle rise, so a 25 C ambient idles at 65.1 C.
+# Derived from the stale snapshot instead it would be 0.45 x 5.24 x 11 = 25.9 C,
+# an idle floor of 50.9 C — 14 C too cool, which is what made a ladder look
+# viable in heat where the balcony measurement proved it is not.
+assert_within "the idle-rise estimate follows the rating, not the snapshot" \
+              65.1 "$(sim "$REF" ambient=25 | rfield idle_floor_c)" 0.2
+
+# The two numbers must be visible separately, or the defect is undiagnosable.
+assert_contains "--detect prints the snapshot separately when it differs from the rating" \
+                "$out" "saved snapshot"
+assert_contains "--detect says the snapshot is not used for budgets" \
+                "$out" "NOT used for budgets"
+assert_contains "--detect names the file and the remedy for a stale snapshot" \
+                "$out" "stopping the service would restore 11W"
+
+# Budgets must be completely unmoved by the stale snapshot: same ground truth.
+assert_eq "ground truth A survives a stale snapshot (25C -> the shipped ladder)" \
+          "80:11,85:7" "$(sim "$REF" ambient=25 | rfield tiers)"
+assert_eq "ground truth B survives a stale snapshot (34C -> constant)" \
+          constant "$(sim "$REF" ambient=34 | rfield mode)"
+
+# And the noise must stop once the snapshot agrees with the rating.
+printf '%s\n' "$STOCK_UW" > "$SNAP"
+out=$(detect "$REF")
+if grep -q "saved snapshot" <<<"$out"
+then fail "no snapshot line when snapshot and rating agree" "printed anyway"
+else pass "no snapshot line when snapshot and rating agree"; fi
+
+# The uncapped baseline itself writes a power limit, so it cannot be exercised
+# without RAPL and root. Assert the wiring instead of faking the hardware.
+tgsrc=$(cat "$TG")
+assert_contains "an engine-owned tier 0 applies the rating, not the snapshot" \
+                "$tgsrc" "apply_uncapped_baseline"
+assert_contains "restore-on-exit still restores the snapshot, which is its real job" \
+                "$tgsrc" 'set_uw "$(<"$stock_power_file")"'
+if grep -q 'ADAPTIVE_ON.*STOCK_RATING_UW\|STOCK_RATING_UW.*ADAPTIVE_ON' <<<"$tgsrc"
+then pass "the rating baseline is gated on ADAPTIVE=yes, so legacy configs are untouched"
+else fail "the rating baseline is gated on ADAPTIVE=yes, so legacy configs are untouched" "gate not found"; fi
 
 # ============================================================================
 group "9. RESULT line grammar — the tooling contract"

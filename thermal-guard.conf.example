@@ -336,9 +336,18 @@
 #                 and CRIT_C all still act below it, so it cannot make you
 #                 unsafe — but `--detect` says "clipped-floor" when it binds, and
 #                 that is the daemon telling you the physics wanted less.
-#   BUDGET_MAX_W  empty = your detected stock RAPL limit. A value above the stock
-#                 limit is clipped to it with a warning; the daemon cannot make
-#                 your CPU faster than it shipped.
+#   BUDGET_MAX_W  empty = the limit your CPU is RATED for, read from the firmware
+#                 (constraint_0_max_power_uw). Deliberately not the snapshot in
+#                 /var/lib/thermal-guard/stock-power-limit-uw: that records
+#                 whatever was in the register the first time this daemon ran,
+#                 which on a machine that was already capped is a cap and not a
+#                 rating — and it never self-corrects. The snapshot keeps its own
+#                 job, which is what to restore on a clean stop.
+#                 A value you set here is used AS WRITTEN and is never clipped
+#                 down to the detected figure; you get a warning naming both
+#                 numbers instead, because the detected one can be the wrong one.
+#                 Note this is a CEILING, not a target — the engine only spends it
+#                 as far as the die target and your cooling actually allow.
 #BUDGET_MIN_W=4.25
 #BUDGET_MAX_W=17
 

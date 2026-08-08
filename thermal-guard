@@ -388,6 +388,8 @@ fi
 # the weather, resolved once. None of it is computed when ADAPTIVE=no, so a
 # config without the feature does not so much as stat the state directory here.
 STOCK_W=15; STOCK_SRC=default
+STOCK_RATING_UW=""         # the hardware's published rating, if it publishes one
+STOCK_SAVED_W=""           # what the snapshot holds, for the mismatch warning
 RTHETA=""; RTHETA_SRC="-"; RTHETA_OUT="-"
 RUNG1_T=0; RUNGTOP_T=0
 WINDOW_MIN_OUT="-"
@@ -395,18 +397,54 @@ BUDGET_MAX_SRC=config; BUDGET_MIN_SRC=config; IDLE_RISE_SRC=config
 HAVE_CURL=0; HAVE_WGET=0; HAVE_TIMEOUT=0
 declare -a ADAPTIVE_NOTES=()
 
-# The stock limit is what BUDGET_MAX_W defaults to, so prefer the value an
-# earlier run saved: once we have capped the package, the live register no
-# longer says what the machine shipped with. Same file save_stock_state writes.
+# What this CPU is RATED to sustain. Three things derive from it — the default
+# BUDGET_MAX_W ceiling, the light-load idle rise, and the engine's uncapped
+# baseline — so getting it wrong is not a cosmetic error, it quietly wrongs the
+# whole plan in the same direction at once.
+#
+# Ask the hardware first. constraint_0_max_power_uw is the ceiling the firmware
+# publishes for that constraint, and unlike the live limit it does not move when
+# we cap the package.
+#
+# The saved snapshot is NOT a rating and must not be treated as one. It is a copy
+# of the live register taken on the first ever run, so a first run that happened
+# while an earlier experiment had the package capped records that cap as though
+# the machine shipped with it — and never self-corrects, because the file is only
+# ever written once. That is not hypothetical: on the author's 17 W i5-3317U the
+# snapshot held 11 W and silently held the ceiling, the idle-rise estimate and the
+# ladder's burst headroom at 11 W for every run thereafter. The snapshot keeps its
+# real job, which is knowing what to put back on exit.
 #
 # Sets STOCK_W and STOCK_SRC rather than printing, because WHERE the number came
-# from matters as much as the number: the state file is a copy of the RAPL
-# register taken on the first ever run, so if that run happened while an earlier
-# experiment had the package capped, it records the cap as though it were stock
-# and never self-corrects. --detect prints both, so it can be argued with.
+# from matters as much as the number. --detect prints both, so it can be argued with.
 find_stock_watts() {
-  local uw="" f="$STATE_DIR/stock-power-limit-uw" src=""
-  if   [[ -r "$f" ]];                                       then uw=$(<"$f"); src="saved state $f"
+  local uw="" f="$STATE_DIR/stock-power-limit-uw" src="" m=""
+  if [[ -r "$f" ]]; then
+    m=$(<"$f")
+    [[ "$m" =~ ^[0-9]+$ ]] && (( m > 0 )) \
+      && STOCK_SAVED_W=$(awk -v u="$m" 'BEGIN{printf "%g", u/1000000}')
+  fi
+  # An explicit override beats detection, and must, for two reasons. The test
+  # suite pins the rating so its physics assertions produce the same numbers on a
+  # bare CI runner and on a developer laptop that really does have RAPL — before
+  # this took precedence, a laptop whose firmware published a different rating
+  # silently rewrote every ground-truth figure. And some firmware simply reports a
+  # wrong rating, which otherwise leaves no way to correct it.
+  if is_num "${THERMAL_GUARD_ASSUME_STOCK_W:-}" \
+     && awk -v x="${THERMAL_GUARD_ASSUME_STOCK_W}" 'BEGIN{exit !(x>0)}'; then
+    STOCK_W=$THERMAL_GUARD_ASSUME_STOCK_W; STOCK_SRC='$THERMAL_GUARD_ASSUME_STOCK_W'
+    STOCK_RATING_UW=$(awk -v w="$STOCK_W" 'BEGIN{printf "%d", w*1000000}')
+    return 0
+  fi
+  if [[ -n "$RAPL" && -r "$RAPL/constraint_0_max_power_uw" ]]; then
+    m=$(<"$RAPL/constraint_0_max_power_uw")
+    if [[ "$m" =~ ^[0-9]+$ ]] && (( m > 0 )); then
+      uw=$m; STOCK_RATING_UW=$m
+      src="hardware rating $RAPL/constraint_0_max_power_uw"
+    fi
+  fi
+  if   [[ -n "$uw" ]]; then :
+  elif [[ -r "$f" ]];  then uw=$(<"$f"); src="saved state $f"
   elif [[ -n "$RAPL" && -r "$RAPL/constraint_0_power_limit_uw" ]]; then
     uw=$(<"$RAPL/constraint_0_power_limit_uw"); src="live RAPL register"
   fi
@@ -462,6 +500,15 @@ if (( ADAPTIVE_ON )); then
   # fire on a value someone typed.)
   if awk -v a="$BUDGET_MAX_W" -v b="$STOCK_W" 'BEGIN{exit !(a>b)}'; then
     ADAPTIVE_NOTES+=("warning: BUDGET_MAX_W (${BUDGET_MAX_W}W) is above the stock power limit this run detected (${STOCK_W}W, from $STOCK_SRC) — your ${BUDGET_MAX_W}W is what the engine uses. If ${STOCK_W}W is not your CPU's rating that reading is stale, and LADDER_IDLE_RISE_C is derived from it too")
+  fi
+  # A snapshot below the rating means an earlier run saved the register while the
+  # package was already capped. Harmless for the engine, which now reads the
+  # rating from the hardware — but restore-on-exit still puts the snapshot back,
+  # so `systemctl stop` would leave the CPU at that old cap. Name the file and the
+  # remedy; a warning that does not say what to do is just noise.
+  if [[ -n "$STOCK_RATING_UW" && -n "$STOCK_SAVED_W" ]] \
+     && awk -v s="$STOCK_SAVED_W" -v r="$STOCK_W" 'BEGIN{exit !(s<r)}'; then
+    ADAPTIVE_NOTES+=("note: the saved stock snapshot (${STOCK_SAVED_W}W, $STATE_DIR/stock-power-limit-uw) is below this CPU's rating (${STOCK_W}W). The engine uses the rating, so budgets are unaffected — but stopping the service would restore ${STOCK_SAVED_W}W. To correct it: systemctl stop thermal-guard, rm that file, then start again")
   fi
   # A derived floor above a derived ceiling means a machine whose stock limit is
   # under 4 W. Clamp rather than refuse: nothing the user typed is wrong.
@@ -600,12 +647,33 @@ apply_watts() {   # $1 = watts (decimals ok)
 }
 
 # Restore stock power, or fall back to NORMAL_WATTS if we never saved stock.
+# Deliberately the SNAPSHOT and not the rating: this is "put back what was here",
+# which is a different question from "what is this CPU rated at". Raising a limit
+# on the way out that we never lowered would be overreach.
 restore_stock_power() {
   (( CAN_CAP )) || return 1
   if [[ -r "$stock_power_file" ]]; then
     set_uw "$(<"$stock_power_file")" && return 0
   fi
   [[ -n "$NORMAL_WATTS" ]] && apply_watts "$NORMAL_WATTS"
+}
+
+# The engine's uncapped baseline. In an engine-owned ladder, tier 0 means "no cap
+# from us", and the honest expression of that is the CPU's rating — not whatever
+# happened to be in the register when this daemon first ran. The two differ
+# exactly when an earlier run left the package capped, and there the snapshot
+# turns tier 0 into a silent cap: the ladder logs "stock" and applies the old
+# limit, so the burst headroom the ladder exists to buy is simply absent.
+#
+# Scoped to ADAPTIVE=yes on purpose. That is an explicit opt-in to letting the
+# engine own the budget, so widening the baseline to the rating is inside what
+# was asked for. A legacy config is left exactly as it was.
+apply_uncapped_baseline() {
+  (( CAN_CAP )) || return 1
+  if (( ADAPTIVE_ON )) && [[ -n "$STOCK_RATING_UW" ]]; then
+    set_uw "$STOCK_RATING_UW" && return 0
+  fi
+  restore_stock_power
 }
 
 set_perf_pct() { (( HAVE_PSTATE )) || return 1; printf '%s\n' "$1" > "$PSTATE/max_perf_pct" 2>/dev/null; }
@@ -620,7 +688,9 @@ apply_tier() {     # $1 = tier index, $2 = current temp
   local i=$1 t=$2 desc perf
   if (( i == 0 )); then
     if [[ -n "$NORMAL_WATTS" ]]; then apply_watts "$NORMAL_WATTS"; desc="${NORMAL_WATTS}W"
-    else restore_stock_power; desc="stock"; fi
+    elif (( ADAPTIVE_ON )) && [[ -n "$STOCK_RATING_UW" ]]; then
+      apply_uncapped_baseline; desc="stock ${STOCK_W}W (rating)"
+    else apply_uncapped_baseline; desc="stock"; fi
     perf=100
   else
     apply_watts "${TIER_W[i-1]}"
@@ -1645,6 +1715,11 @@ print_adaptive() {
   # the real rating, every one of them is quietly wrong with nothing on screen
   # to check it against.
   printf "$f" 'stock power limit' "${STOCK_W}W  (from $STOCK_SRC — compare this with your CPU's rated TDP)"
+  # Printed separately and only when they disagree, because the two numbers answer
+  # different questions and conflating them is the bug this line exists to expose.
+  if [[ -n "$STOCK_SAVED_W" ]] && [[ "$STOCK_SAVED_W" != "$STOCK_W" ]]; then
+    printf "$f" 'saved snapshot' "${STOCK_SAVED_W}W  (restored on exit; NOT used for budgets)"
+  fi
   printf "$f" 'budget band' "${BUDGET_MIN_W}W .. ${BUDGET_MAX_W}W  (floor $BUDGET_MIN_SRC, ceiling $BUDGET_MAX_SRC)"
   printf "$f" 'sustainable budget' "${PROP_BUDGET}W  ($PROP_BUDGET_SRC)"
   printf "$f" 'light-load floor' "$(printf '%sC  (ambient + %.1fC idle rise, %s)' "$PLAN_IDLE" "$LADDER_IDLE_RISE_C" "$IDLE_RISE_SRC")"

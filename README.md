@@ -492,8 +492,8 @@ ambient, and four independent layers bound what that buys:
    connect at all.
 2. Indoors, the `max(0, …)` floor means no reported temperature, however cold, pushes
    the assumed room below `INDOOR_BASE_C`.
-3. `BUDGET_MAX_W` defaults to your detected stock RAPL limit, so the worst outcome on
-   the outdoor path is the power limit the machine shipped with.
+3. `BUDGET_MAX_W` defaults to the CPU's own rated limit as published by the firmware,
+   so the worst outcome on the outdoor path is the power the part is rated for.
 4. `CRIT_C` and the emergency rung run every 2 seconds off the local sensor and are
    completely independent of the network.
 
@@ -649,7 +649,7 @@ one costs you.
 | `RTHETA_C_PER_W` | *derived* | Degrees the die rises per watt — your cooling. **Measure it**; the whole budget scales with it |
 | `DIE_TARGET_C` | `CRIT_C − DIE_TARGET_MARGIN_C` | Steady-state die temperature the budget aims for |
 | `BUDGET_MIN_W` | `max(4, 25% of stock)` | Usability floor, **not** a safety floor — the top rung and `CRIT_C` still act below it |
-| `BUDGET_MAX_W` | detected stock limit | Ceiling. A value above the stock limit is clipped to it, with a warning |
+| `BUDGET_MAX_W` | the CPU's rated limit, read from `constraint_0_max_power_uw` | Ceiling. A value you set is used **as written**, never clipped down — you get a warning naming both numbers instead |
 | `INDOOR_BASE_C` | `22` | What a heated/cooled building sits at. The indoor estimate never goes below this |
 | `INDOOR_COUPLING` | `0.35` | Fraction of the outdoor excess above `INDOOR_BASE_C` that reaches the room |
 | `DIE_TARGET_MARGIN_C` | `5` | Gap below `CRIT_C`: 1 °C package-vs-core + 2 °C die ripple + 2 °C ambient error |
@@ -840,20 +840,43 @@ is actually indoors will track the real weather far more violently than the room
 `--detect` prints it on its own line in the adaptive block, with where it came from:
 
 ```
-  stock power limit  : 11W  (from saved state /var/lib/thermal-guard/stock-power-limit-uw — compare this with your CPU's rated TDP)
+  stock power limit  : 17W  (from hardware rating /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw — compare this with your CPU's rated TDP)
+  saved snapshot     : 11W  (restored on exit; NOT used for budgets)
 ```
 
-That file is a copy of your RAPL register taken the first time the guard ever ran. If
-that first run happened while an earlier experiment had already capped the package,
-the file records the **cap** as though it were stock, and it never self-corrects. Both
-the default `BUDGET_MAX_W` and the derived `LADDER_IDLE_RISE_C` come from it, and the
-idle rise is what decides ladder-versus-constant — so a stale value here can pick a
-ladder on a day that wanted a flat cap. Check it against your CPU's TDP; if it is
-wrong, stop the service, delete that file, reboot so the register returns to its real
-value, and start again. Or set `BUDGET_MAX_W` and `LADDER_IDLE_RISE_C` explicitly,
-which is what [`examples/asus-s550ca-adaptive.conf`](examples/asus-s550ca-adaptive.conf)
-does — an explicitly configured `BUDGET_MAX_W` is used as written and is never clipped
-down to a detected figure, though you do get a warning naming both numbers.
+Those two lines answer **different questions**, and conflating them was a real defect
+in this tool:
+
+| | what it is | what it drives |
+|---|---|---|
+| **stock power limit** | what the CPU is *rated* to sustain, read from the firmware's own `constraint_0_max_power_uw` | the `BUDGET_MAX_W` ceiling, the derived `LADDER_IDLE_RISE_C`, and the engine's uncapped baseline |
+| **saved snapshot** | what was in the register *before this daemon first ran* | only what gets restored on a clean stop |
+
+The snapshot is a copy of the live register taken on the first ever run. If that run
+happened while an earlier experiment had already capped the package, the snapshot
+records the **cap** as though the machine shipped with it, and it never self-corrects —
+the file is written once and only once. Until 1.2.0 the snapshot was also the answer to
+the first question, which meant one stale file quietly held three separate derivations
+at the wrong value. On the case-study machine it pinned an 11 W cap onto a 17 W part:
+the ceiling became 11 W so cold weather bought nothing, the idle-rise estimate came out
+14 °C too cool so a ladder looked viable on days that wanted a flat cap, and tier 0
+logged `stock` while applying 11 W, so the burst headroom the ladder exists to buy was
+simply absent.
+
+The rating is now read from the hardware, so a stale snapshot no longer touches any
+budget. The second line only appears when the two disagree. It still matters, because
+`RESTORE_ON_EXIT=yes` will put that old cap back when you stop the service — to correct
+it, stop the service, delete `/var/lib/thermal-guard/stock-power-limit-uw`, reboot so
+the register returns to its firmware value, and start again.
+
+If your firmware publishes no rating, or publishes a wrong one, set `BUDGET_MAX_W` and
+`LADDER_IDLE_RISE_C` explicitly — which is what
+[`examples/asus-s550ca-adaptive.conf`](examples/asus-s550ca-adaptive.conf) does. An
+explicitly configured `BUDGET_MAX_W` is used as written and is never clipped down to a
+detected figure, though you do get a warning naming both numbers. For scripted or
+diagnostic use, `$THERMAL_GUARD_ASSUME_STOCK_W` overrides detection outright; the test
+suite uses it to pin the rating so its physics assertions produce identical numbers on
+a bare CI runner and on a laptop with real RAPL.
 
 ---
 
