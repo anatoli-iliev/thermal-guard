@@ -768,6 +768,48 @@ A few percent is a ladder doing its job. Sustained high numbers mean the budget 
 below what your workload wants — either the weather turned, or the machine wants a
 constant cap rather than a ladder. Check which with the plan history below.
 
+### How many clamps, and how long did each one last?
+
+That percentage cannot tell ten one-second dips apart from one ten-second hold, and
+those are very different machines. [`contrib/thermal-clamps.sh`](contrib/thermal-clamps.sh)
+reports each **episode** — an unbroken stretch above the baseline tier — with how long
+it actually ran:
+
+```bash
+./contrib/thermal-clamps.sh              # last hour
+./contrib/thermal-clamps.sh "" 6         # last six hours
+./contrib/thermal-clamps.sh "" 0.25      # the last 15 minutes
+./contrib/thermal-clamps.sh "" 1 85 88   # thresholds matching your own config
+```
+
+```
+== thermal-guard: last 1h of /var/log/thermal-trace.log ==
+window : since 2026-08-08 09:16:18
+samples: 1773 over 1h00m (2.0s apart)
+
+temperature
+  min 63C   mean 71.2C   max 85C
+  at or above 80C : 10m41s (17.8%)
+  at or above 85C : 8s (0.2%)
+
+clamp episodes: 1   total 12m30s (20.8% of the window)
+  #   started    lasted    peak
+  1   09:27:18   12m30s    85C
+  longest 12m30s, shortest 12m30s, mean 12m30s
+```
+
+Durations come from the timestamps, not from a sample count times an assumed
+`POLL_SEC` — the daemon can be restarted with a different interval, and a laptop can
+suspend mid-episode. An episode still running when the window ends is marked
+`(still clamped)`. The window is selected by timestamp, so a gap in the trace does not
+silently widen it into yesterday.
+
+Many short episodes mean the die is oscillating around a rung: the budget at that rung
+settles near the rung's own temperature, so it trips, cools, releases and trips again.
+That is the degenerate case where a constant cap beats a ladder — `ADAPTIVE_MODE=constant`,
+or a wider `TIER_HYSTERESIS`. One long episode instead means the workload simply wants
+more than the weather allows, which is the ladder working as designed.
+
 ### How hot did it actually get?
 
 ```bash

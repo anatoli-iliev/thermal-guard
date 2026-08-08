@@ -14,7 +14,7 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck -S warning thermal-guard install.sh uninstall.sh tests/run-tests.sh contrib/thermal-summary.sh
+        run: shellcheck -S warning thermal-guard install.sh uninstall.sh tests/run-tests.sh contrib/thermal-summary.sh contrib/thermal-clamps.sh
 
   smoke:
     name: smoke test
